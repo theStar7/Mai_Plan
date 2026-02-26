@@ -1,0 +1,63 @@
+{
+  "manifest_version": 1,
+  "name": "麦麦计划表(Mai_Plan)",
+  "version": "0.2.0",
+  "description": "基于日程提醒的自动化插件，可根据聊天内容自动创建计划任务，并在指定时间提醒用户。",
+  "author": {
+    "name": "theStar7",
+    "url": "https://github.com/theStar7"
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "0.12.1"
+  },
+  "homepage_url": "https://github.com/theStar7/Mai_Plan",
+  "repository_url": "https://github.com/theStar7/Mai_Plan",
+  "keywords": [
+    "chat",
+    "qq",
+    "proactive",
+    "memory",
+    "context"
+  ],
+  "categories": [
+    "Utility Tools",
+    "Entertainment & Interaction"
+  ],
+  "default_locale": "zh-CN",
+  "locales_path": "_locales",
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "chat",
+    "components": [
+      {
+        "type": "action",
+        "name": "create_plan_task",
+        "description": "根据聊天上下文创建计划任务"
+      },
+      {
+        "type": "command",
+        "name": "mai_plan_command",
+        "description": "管理计划任务",
+        "pattern": "/mai_plan help|list|cancel"
+      },
+      {
+        "type": "event_handler",
+        "name": "mai_plan_startup_handler",
+        "description": "启动提醒调度器"
+      },
+      {
+        "type": "event_handler",
+        "name": "mai_plan_stop_handler",
+        "description": "停止提醒调度器"
+      }
+    ],
+    "features": [
+      "聊天内容自动生成计划任务",
+      "定时触发自动提醒",
+      "支持查看和取消任务",
+      "任务文件本地持久化"
+    ]
+  },
+  "id": "Mai_Plan"
+}
