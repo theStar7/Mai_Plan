@@ -19,9 +19,11 @@ from src.plugin_system import (
     BaseCommand,
     BaseEventHandler,
     BasePlugin,
+    BaseTool,
     ComponentInfo,
     ConfigField,
     EventType,
+    ToolParamType,
     register_plugin,
 )
 from src.plugin_system.apis import send_api
@@ -57,7 +59,7 @@ class CreatePlanTaskAction(BaseAction):
     action_require = [
         "当用户表达提醒诉求时使用",
         "当聊天的内容需要在未来被回忆起来并继续时使用",
-        "聊天涉及未来的某时刻, 需要在未来特定时间回忆起来的并继续的话题"
+        "聊天涉及未来的某时刻, 需要在未来特定时间回忆起来的并继续的话题",
         "如果已经存在相同内容和时间的计划任务, 则不使用该action",
     ]
     associated_types = ["text"]
@@ -238,6 +240,216 @@ class MaiPlanCommand(BaseCommand):
         return "\n".join(lines)
 
 
+class CreatePlanTaskTool(BaseTool):
+    """创建计划任务工具（供 LLM 调用）"""
+
+    name = "create_plan_task_tool"
+    description = (
+        "创建一个计划任务，在指定的未来时间触发提醒。"
+        "适用于用户提到需要提醒、日程安排、未来某时刻要回忆的话题等场景。"
+        "适用于感知到对方关心的事情将在未来发生，主动设置提醒以展现关心和记忆力"
+        "当前话题聊到一半但需要在未来某个时刻继续讨论，记录下来以便到时重新提起"
+        "适用于聊天中提到了未来某个时间点的重要事件（如节日、生日、考试、活动等），主动记录下来以便届时回忆"
+    )
+    parameters = [
+        ("task_content", ToolParamType.STRING, "详细记录任务内容或提醒事项的具体描述", True, None),
+        (
+            "remind_time",
+            ToolParamType.STRING,
+            f"提醒触发时间，格式为 {DEFAULT_TIME_FORMAT}，例如 2026-03-01 09:00:00",
+            True,
+            None,
+        ),
+        ("creator_name", ToolParamType.STRING, "创建者名称（可从上下文获取）", False, None),
+    ]
+    available_for_llm = True
+
+    async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
+        """执行创建计划任务。"""
+        global _plugin_instance
+
+        if _plugin_instance is None:
+            return {"name": self.name, "content": "错误：Mai_Plan 插件未初始化"}
+
+        if not self.chat_stream or not self.chat_id:
+            return {"name": self.name, "content": "错误：无法获取当前会话信息"}
+
+        task_content = str(function_args.get("task_content", "")).strip()
+        remind_time = str(function_args.get("remind_time", "")).strip()
+        creator_name = str(function_args.get("creator_name", "")).strip() or "未知用户"
+
+        if not task_content:
+            return {"name": self.name, "content": "错误：task_content 不能为空"}
+        if not remind_time:
+            return {"name": self.name, "content": "错误：remind_time 不能为空"}
+
+        platform = str(getattr(self.chat_stream, "platform", "") or "")
+        is_group = bool(getattr(self.chat_stream, "is_group", False))
+
+        try:
+            success, reply_text, _ = await _plugin_instance.create_task(
+                chat_id=self.chat_id,
+                creator_user_id="",
+                creator_name=creator_name,
+                content=task_content,
+                remind_time_str=remind_time,
+                source_message_id="",
+                platform=platform,
+                is_group=is_group,
+            )
+            return {"name": self.name, "content": reply_text}
+        except Exception as exc:
+            logger.error(f"[Mai_Plan] CreatePlanTaskTool 执行异常：{exc}")
+            return {"name": self.name, "content": f"创建计划任务时发生错误：{exc}"}
+
+
+class DeletePlanTaskTool(BaseTool):
+    """删除（取消）计划任务工具（供 LLM 调用）"""
+
+    name = "delete_plan_task_tool"
+    description = "根据任务内容删除（取消）当前会话中的待处理计划任务。支持模糊匹配，会删除内容中包含关键词的任务。"
+    parameters = [
+        (
+            "task_content",
+            ToolParamType.STRING,
+            "要取消的任务内容关键词，将匹配内容中包含该关键词的待处理任务",
+            True,
+            None,
+        ),
+    ]
+    available_for_llm = True
+
+    async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
+        """根据任务内容匹配并删除计划任务。"""
+        global _plugin_instance
+
+        if _plugin_instance is None:
+            return {"name": self.name, "content": "错误：Mai_Plan 插件未初始化"}
+
+        if not self.chat_stream or not self.chat_id:
+            return {"name": self.name, "content": "错误：无法获取当前会话信息"}
+
+        task_content = str(function_args.get("task_content", "")).strip()
+        if not task_content:
+            return {"name": self.name, "content": "错误：task_content 不能为空"}
+
+        try:
+            # 先查询当前会话的待处理任务
+            tasks = await _plugin_instance.list_tasks(
+                chat_id=self.chat_id,
+                include_done=False,
+            )
+
+            # 按内容模糊匹配
+            matched = [
+                t for t in tasks
+                if task_content in str(t.get("content", "")) + str(t.get("task_id", ""))
+            ]
+
+            if not matched:
+                return {
+                    "name": self.name,
+                    "content": f"未找到内容包含「{task_content}」的待处理任务",
+                }
+
+            if len(matched) > 1:
+                lines = [f"找到 {len(matched)} 条匹配任务，已全部取消："]
+            else:
+                lines = []
+
+            for task in matched:
+                task_id = str(task.get("task_id", ""))
+                success, text = await _plugin_instance.cancel_task(
+                    chat_id=self.chat_id,
+                    task_id=task_id,
+                    operator_user_id="",
+                    is_admin=True,
+                )
+                content = str(task.get("content", ""))
+                remind_at = str(task.get("remind_at", ""))
+                if success:
+                    lines.append(f"已取消任务：{content}（提醒时间：{remind_at}）")
+                else:
+                    lines.append(f"取消失败：{content} - {text}")
+
+            return {"name": self.name, "content": "\n".join(lines)}
+        except Exception as exc:
+            logger.error(f"[Mai_Plan] DeletePlanTaskTool 执行异常：{exc}")
+            return {"name": self.name, "content": f"删除计划任务时发生错误：{exc}"}
+
+
+class ListPlanTasksTool(BaseTool):
+    """查询计划任务列表工具（供 LLM 调用）"""
+
+    name = "list_plan_tasks_tool"
+    description = "查询当前会话中的计划任务列表，可选择查看全部或仅待处理任务"
+    parameters = [
+        (
+            "mode",
+            ToolParamType.STRING,
+            "查询模式：pending（仅待处理，默认）或 all（包含已完成和已取消的全部任务）",
+            False,
+            None,
+        ),
+    ]
+    available_for_llm = True
+
+    async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
+        """执行查询计划任务列表。"""
+        global _plugin_instance
+
+        if _plugin_instance is None:
+            return {"name": self.name, "content": "错误：Mai_Plan 插件未初始化"}
+
+        if not self.chat_stream or not self.chat_id:
+            return {"name": self.name, "content": "错误：无法获取当前会话信息"}
+
+        mode = str(function_args.get("mode", "pending")).strip().lower()
+        if mode not in {"pending", "all"}:
+            mode = "pending"
+
+        try:
+            tasks = await _plugin_instance.list_tasks(
+                chat_id=self.chat_id,
+                include_done=(mode == "all"),
+            )
+            content = self._format_task_list(tasks, mode)
+            return {"name": self.name, "content": content}
+        except Exception as exc:
+            logger.error(f"[Mai_Plan] ListPlanTasksTool 执行异常：{exc}")
+            return {"name": self.name, "content": f"查询计划任务时发生错误：{exc}"}
+
+    @staticmethod
+    def _format_task_list(tasks: List[Dict[str, Any]], mode: str) -> str:
+        """将任务列表格式化为可读文本。"""
+        if not tasks:
+            if mode == "all":
+                return "当前会话暂无任何计划任务"
+            return "当前会话暂无待处理计划任务"
+
+        lines = [f"当前会话任务列表（{len(tasks)} 条，模式：{mode}）"]
+        max_show = 20
+
+        for index, task in enumerate(tasks[:max_show], start=1):
+            task_id = str(task.get("task_id", "-"))
+            content = str(task.get("content", "-"))
+            remind_at = str(task.get("remind_at", "-"))
+            status = str(task.get("status", ""))
+            status_map = {
+                TASK_STATUS_PENDING: "待提醒",
+                TASK_STATUS_SENT: "已提醒",
+                TASK_STATUS_FAILED: "失败",
+                TASK_STATUS_CANCELLED: "已取消",
+            }
+            status_text = status_map.get(status, status or "未知")
+            lines.append(f"{index}. [{task_id}] {content} | {remind_at} | {status_text}")
+
+        if len(tasks) > max_show:
+            lines.append(f"... 还有 {len(tasks) - max_show} 条任务未显示")
+
+        return "\n".join(lines)
+
+
 class MaiPlanStartupHandler(BaseEventHandler):
     """启动时启动调度器"""
 
@@ -378,6 +590,9 @@ class MaiPlanPlugin(BasePlugin):
             (MaiPlanCommand.get_command_info(), MaiPlanCommand),
             (MaiPlanStartupHandler.get_handler_info(), MaiPlanStartupHandler),
             (MaiPlanStopHandler.get_handler_info(), MaiPlanStopHandler),
+            (CreatePlanTaskTool.get_tool_info(), CreatePlanTaskTool),
+            (DeletePlanTaskTool.get_tool_info(), DeletePlanTaskTool),
+            (ListPlanTasksTool.get_tool_info(), ListPlanTasksTool),
         ]
 
     @staticmethod

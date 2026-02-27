@@ -50,13 +50,29 @@
         "type": "event_handler",
         "name": "mai_plan_stop_handler",
         "description": "停止提醒调度器"
+      },
+      {
+        "type": "tool",
+        "name": "create_plan_task_tool",
+        "description": "创建计划任务（LLM 工具调用）"
+      },
+      {
+        "type": "tool",
+        "name": "delete_plan_task_tool",
+        "description": "删除计划任务（LLM 工具调用）"
+      },
+      {
+        "type": "tool",
+        "name": "list_plan_tasks_tool",
+        "description": "查询计划任务列表（LLM 工具调用）"
       }
     ],
     "features": [
       "聊天内容自动生成计划任务",
       "定时触发自动提醒",
       "支持查看和取消任务",
-      "任务文件本地持久化"
+      "任务文件本地持久化",
+      "支持 LLM 工具调用（创建/删除/查询任务）"
     ]
   },
   "id": "Mai_Plan"
