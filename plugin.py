@@ -50,13 +50,14 @@ class CreatePlanTaskAction(BaseAction):
     activation_type = ActionActivationType.ALWAYS
     parallel_action = True
     action_parameters = {
-        "task_content": "任务内容或记忆内容（简洁明确）",
+        "topic": "内容的性质(如提醒计划、未来话题等)，由根据聊天内容进行提取和判断",
+        "task_content": "提醒,任务,记忆或话题的具体内容",
         "remind_time": f"未来的回忆时间 或 调用提醒的时间，格式 {DEFAULT_TIME_FORMAT}",
     }
     action_require = [
         "当用户表达提醒诉求时使用",
-        "当聊天内容需要在未来被回忆起来时使用",
-        "存在,需要在未来特定时间回忆起来的并继续的话题"
+        "当聊天的内容需要在未来被回忆起来并继续时使用",
+        "聊天涉及未来的某时刻, 需要在未来特定时间回忆起来的并继续的话题"
         "如果已经存在相同内容和时间的计划任务, 则不使用该action",
     ]
     associated_types = ["text"]
@@ -347,6 +348,9 @@ class MaiPlanPlugin(BasePlugin):
         "permission": {
             "admin_user_ids": ConfigField(type=list, default=[], description="管理员用户 ID 列表"),
         },
+        "Others": {
+            "save_plan_history": ConfigField(type=bool, default=True, description="任务完成后是否将记录归档到 plan_history.json（否则直接删除）"),
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -531,6 +535,72 @@ class MaiPlanPlugin(BasePlugin):
             if tmp_file.exists():
                 with contextlib.suppress(Exception):
                     tmp_file.unlink()
+
+    def _get_history_file_path(self) -> Path:
+        """
+        获取历史任务文件 plan_history.json 的完整路径。
+
+        Returns:
+            Path: 历史文件路径
+        """
+        return Path(self.plugin_dir) / "plan_history.json"
+
+    def _read_history_unlocked(self) -> List[Dict[str, Any]]:
+        """
+        读取历史任务列表（不加锁，需外部同步调用）。
+        若文件不存在或损坏，返回空列表。
+
+        Returns:
+            List[Dict[str, Any]]: 历史任务列表
+        """
+        history_file = self._get_history_file_path()
+        if not history_file.exists():
+            return []
+
+        try:
+            with history_file.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)]
+            return []
+        except Exception as error:
+            logger.error(f"[Mai_Plan] 读取历史文件失败：{error}")
+            return []
+
+    def _write_history_unlocked(self, history: List[Dict[str, Any]]) -> None:
+        """
+        写入历史任务列表（不加锁，需外部同步调用）。
+        使用临时文件和原子操作保证数据完整性。
+
+        Args:
+            history: 历史任务列表
+        """
+        history_file = self._get_history_file_path()
+        history_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = history_file.with_suffix(".json.tmp")
+
+        try:
+            with tmp_file.open("w", encoding="utf-8") as file:
+                json.dump(history, file, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, history_file)
+        finally:
+            if tmp_file.exists():
+                with contextlib.suppress(Exception):
+                    tmp_file.unlink()
+
+    def _archive_task_to_history(self, task: Dict[str, Any]) -> None:
+        """
+        将已完成的任务归档到 plan_history.json。
+        需在持有 _tasks_lock 时调用。
+
+        Args:
+            task: 待归档的任务字典
+        """
+        history = self._read_history_unlocked()
+        archived = dict(task)
+        archived["archived_at"] = self._format_now()
+        history.append(archived)
+        self._write_history_unlocked(history)
 
     def _parse_remind_datetime(self, remind_time_str: str) -> Tuple[Optional[datetime], str]:
         """
@@ -947,6 +1017,14 @@ class MaiPlanPlugin(BasePlugin):
                     target_task["status"] = TASK_STATUS_SENT
                     target_task["triggered_at"] = update_time
                     target_task["last_error"] = ""
+
+                    if self.get_config("Others.计划完成后保留任务记录", True):
+                        self._archive_task_to_history(target_task)
+
+                    latest_document["tasks"] = [
+                        t for t in latest_tasks
+                        if str(t.get("task_id", "")) != task_id
+                    ]
                 else:
                     current_retry = self._safe_int(target_task.get("retry_count", 0), 0, 0)
                     current_retry += 1
@@ -1000,7 +1078,7 @@ class MaiPlanPlugin(BasePlugin):
 
         generate_reply_success, llm_response = await generator_api.generate_reply(
             chat_id = target_stream_id, 
-            reply_reason="现在需要执行你的回复计划",
+            reply_reason="现在需要执行你的回复计划或继续过去话题",
             extra_info = "请依据以下信息生成符合人设回复内容：\n" + message_text,
             )
 
