@@ -132,23 +132,23 @@ class MaiPlanCommand(BaseCommand):
         global _plugin_instance
 
         if _plugin_instance is None:
-            await self.send_text("Mai_Plan 插件尚未初始化")
+            await self.send_text("Mai_Plan 插件尚未初始化", storage_message = False)
             return False, "插件未初始化", 2
 
         if not self.message.chat_stream or not self.message.chat_stream.stream_id:
-            await self.send_text("无法获取当前会话信息")
+            await self.send_text("无法获取当前会话信息", storage_message = False)
             return False, "会话信息缺失", 2
 
         args = (self.matched_groups.get("args") or "").strip() if self.matched_groups else ""
         if not args:
-            await self.send_text(self._build_help_text())
+            await self.send_text(self._build_help_text(), storage_message = False)
             return True, None, 2
 
         segments = args.split()
         subcommand = segments[0].lower()
 
         if subcommand in {"help", "-h", "--help"}:
-            await self.send_text(self._build_help_text())
+            await self.send_text(self._build_help_text(), storage_message = False)
             return True, None, 2
 
         if subcommand == "list":
@@ -157,19 +157,19 @@ class MaiPlanCommand(BaseCommand):
                 mode = segments[1].lower()
 
             if mode not in {"pending", "all"}:
-                await self.send_text("参数错误：list 仅支持 pending 或 all")
+                await self.send_text("参数错误：list 仅支持 pending 或 all", storage_message = False)
                 return False, "list 参数错误", 2
 
             tasks = await _plugin_instance.list_tasks(
                 chat_id=self.message.chat_stream.stream_id,
                 include_done=(mode == "all"),
             )
-            await self.send_text(self._format_task_list(tasks, mode))
+            await self.send_text(self._format_task_list(tasks, mode), storage_message = False)
             return True, None, 2
 
         if subcommand == "cancel":
             if len(segments) < 2:
-                await self.send_text("用法：/mai_plan cancel <task_id>")
+                await self.send_text("用法：/mai_plan cancel <task_id>", storage_message = False)
                 return False, "缺少 task_id", 2
 
             task_id = segments[1].strip()
@@ -182,10 +182,11 @@ class MaiPlanCommand(BaseCommand):
                 operator_user_id=operator_user_id,
                 is_admin=is_admin,
             )
-            await self.send_text(text)
+            await self.send_text(text, storage_message = False  )
+            
             return success, text, 2
 
-        await self.send_text("未知子命令，请使用 /mai_plan help 查看帮助")
+        await self.send_text("未知子命令，请使用 /mai_plan help 查看帮助", storage_message = False)
         return False, "未知子命令", 2
 
     def _build_help_text(self) -> str:
