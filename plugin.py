@@ -912,6 +912,14 @@ class MaiPlanPlugin(BasePlugin):
             target_task["status"] = TASK_STATUS_CANCELLED
             target_task["cancelled_at"] = self._format_now()
             target_task["last_error"] = ""
+
+            if self.get_config("Others.save_plan_history", True):
+                self._archive_task_to_history(target_task)
+
+            document["tasks"] = [
+                t for t in tasks
+                if str(t.get("task_id", "")) != task_id
+            ]
             self._write_tasks_document_unlocked(document)
 
         return True, f"已取消任务 {task_id}"
