@@ -61,6 +61,11 @@
       },
       {
         "type": "tool",
+        "name": "modify_plan_task_tool",
+        "description": "修改计划任务（LLM 工具调用）"
+      },
+      {
+        "type": "tool",
         "name": "list_plan_tasks_tool",
         "description": "查询计划任务列表（LLM 工具调用）"
       }
@@ -70,7 +75,7 @@
       "定时触发自动提醒",
       "支持查看和取消任务",
       "任务文件本地持久化",
-      "支持 LLM 工具调用（创建/删除/查询任务）"
+      "支持 LLM 工具调用（创建/修改/删除/查询任务）"
     ]
   },
   "id": "Mai_Plan"
