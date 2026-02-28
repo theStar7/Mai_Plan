@@ -49,7 +49,7 @@ class CreatePlanTaskAction(BaseAction):
 
     action_name = "create_plan_task"
     action_description = "根据聊天内容创建计划任务，并在指定时间提醒用户"
-    activation_type = ActionActivationType.ALWAYS
+    activation_type = ActionActivationType.NEVER
     parallel_action = True
     action_parameters = {
         "topic": "内容的性质(如提醒计划、未来话题等)，由根据聊天内容进行提取和判断",
@@ -848,7 +848,7 @@ class MaiPlanPlugin(BasePlugin):
     def _generate_task_id(self, existing_ids: set[str]) -> str:
         """
         生成唯一的任务 ID。
-        格式：p_YYYYMMDDHHmmss_hex8
+        格式：p_hex6
         
         Args:
             existing_ids: 已存在的任务 ID 集合（用于避免重复）
@@ -857,10 +857,10 @@ class MaiPlanPlugin(BasePlugin):
             str: 新生成的任务 ID
         """
         for _ in range(10):
-            task_id = f"p_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            task_id = f"p_{uuid.uuid4().hex[:6]}"
             if task_id not in existing_ids:
                 return task_id
-        return f"p_{uuid.uuid4().hex}"
+        return f"p_{uuid.uuid4().hex[:12]}"
 
     def _resolve_target_stream_id(self, task: Dict[str, Any]) -> str:
         """
