@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from src.chat.message_receive.chat_stream import get_chat_manager
+from src.plugin_system.apis import llm_api
+from src.config.config import global_config, model_config
+
 
 
 from src.common.logger import get_logger
@@ -62,7 +66,7 @@ class CreatePlanTaskAction(BaseAction):
         "聊天涉及未来的某时刻, 需要在未来特定时间回忆起来的并继续的话题",
         "如果已经存在相同内容和时间的计划任务, 则不使用该action",
     ]
-    associated_types = ["text"]
+    #associated_types = ["text"]
 
     async def execute(self) -> Tuple[bool, str]:
         """
@@ -245,10 +249,10 @@ class CreatePlanTaskTool(BaseTool):
 
     name = "create_plan_task_tool"
     description = (
-        "创建一个计划任务，在指定的未来时间触发提醒。"
-        "适用于用户提到需要提醒、日程安排、未来某时刻要回忆的话题等场景。"
-        "适用于感知到对方关心的事情将在未来发生，主动设置提醒以展现关心和记忆力"
-        "当前话题聊到一半但需要在未来某个时刻继续讨论，记录下来以便到时重新提起"
+        "创建一个或多个计划任务，在指定的未来时间触发提醒。"
+        "适用于用户提到需要提醒、日程安排。"
+        "适用于感知到对方关心的事情将在未来发生，则主动记录下来"
+        "当前话题聊到一半但需要在未来某个时刻继续讨论，主动记录下来"
         "适用于聊天中提到了未来某个时间点的重要事件（如节日、生日、考试、活动等），主动记录下来以便届时回忆"
     )
     parameters = [
@@ -307,12 +311,16 @@ class DeletePlanTaskTool(BaseTool):
     """删除（取消）计划任务工具（供 LLM 调用）"""
 
     name = "delete_plan_task_tool"
-    description = "根据任务内容删除（取消）当前会话中的待处理计划任务。支持模糊匹配，会删除内容中包含关键词的任务。"
+    description = (
+        "根据用户提供的线索，在当前会话中取消删除待处理计划任务。"
+        "线索可包含 task_id、任务内容关键词、提醒时间或相关事件信息。"
+        "适用于用户表达取消计划的意图，或用户提到相关事件已发生无需提醒时，主动取消相关计划任务"
+    )
     parameters = [
         (
             "task_content",
             ToolParamType.STRING,
-            "要取消的任务内容关键词，将匹配内容中包含该关键词的待处理任务",
+            "要取消的任务, 包含时间或内容或task_id等关键信息的关键词, 工具会根据该关键词模糊匹配待处理任务列表并取消匹配到的任务",
             True,
             None,
         ),
@@ -332,7 +340,7 @@ class DeletePlanTaskTool(BaseTool):
         task_content = str(function_args.get("task_content", "")).strip()
         if not task_content:
             return {"name": self.name, "content": "错误：task_content 不能为空"}
-
+        
         try:
             # 先查询当前会话的待处理任务
             tasks = await _plugin_instance.list_tasks(
@@ -340,16 +348,37 @@ class DeletePlanTaskTool(BaseTool):
                 include_done=False,
             )
 
-            # 按内容模糊匹配
-            matched = [
-                t for t in tasks
-                if task_content in str(t.get("content", "")) + str(t.get("task_id", ""))
-            ]
+            matched: List[Dict[str, Any]] = []
+            llm_success, llm_content, reasoning, model_name = await llm_api.generate_with_model(
+                f"你是任务匹配助手。请在“待处理任务列表”中找到与关键词「{task_content}」对应的一条或多条任务，并仅返回该任务的 task_id。\n"
+                "输出规则：\n"
+                "1) 只能输出 task_id 本身；\n"
+                "2) 不要输出解释、前后缀、标点、换行或代码块；\n"
+                "3) 若没有明确匹配项，返回空字符串；\n"
+                f"待处理任务列表：{tasks}",
+                model_config.model_task_config.tool_use,
+                request_type="mai_only_you",
+            )
+            if llm_success and llm_content:
+                returned_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", llm_content.strip()))
+                if not returned_ids:
+                    returned_ids = {llm_content.strip()}
+                matched = [
+                    task
+                    for task in tasks
+                    if str(task.get("task_id", "")) in returned_ids
+                ]
+
+            # 旧版本的模糊匹配逻辑，可能会误伤多个任务，因此改为让 LLM 精确返回 task_id 来匹配
+            # matched = [
+            #     t for t in tasks
+            #     if task_content in str(t.get("content", "")) + str(t.get("task_id", ""))
+            # ]
 
             if not matched:
                 return {
                     "name": self.name,
-                    "content": f"未找到内容包含「{task_content}」的待处理任务",
+                    "content": f"未找到内容包含「{task_content}」的待处理任务, 删除任务失败, 删除任务失败, 删除任务失败, 请询问用户提供更准确的任务信息（如完整的任务内容、提醒时间或直接提供以便正确匹配和删除",
                 }
 
             if len(matched) > 1:
@@ -359,18 +388,18 @@ class DeletePlanTaskTool(BaseTool):
 
             for task in matched:
                 task_id = str(task.get("task_id", ""))
-                success, text = await _plugin_instance.cancel_task(
+                cancel_success, text = await _plugin_instance.cancel_task(
                     chat_id=self.chat_id,
                     task_id=task_id,
                     operator_user_id="",
                     is_admin=True,
                 )
-                content = str(task.get("content", ""))
+                task_text = str(task.get("content", ""))
                 remind_at = str(task.get("remind_at", ""))
-                if success:
-                    lines.append(f"已取消任务：{content}（提醒时间：{remind_at}）")
+                if cancel_success:
+                    lines.append(f"已取消成功任务：{task_text}（提醒时间：{remind_at}）")
                 else:
-                    lines.append(f"取消失败：{content} - {text}")
+                    lines.append(f"取消失败：{task_text} - {text}, 没有找到内容包含「{task_content}」的待处理任务")
 
             return {"name": self.name, "content": "\n".join(lines)}
         except Exception as exc:
@@ -382,7 +411,7 @@ class ListPlanTasksTool(BaseTool):
     """查询计划任务列表工具（供 LLM 调用）"""
 
     name = "list_plan_tasks_tool"
-    description = "查询当前会话中的计划任务列表，可选择查看全部或仅待处理任务"
+    description = "适用于查询当前会话中的计划任务列表，可选择查看全部或仅待处理任务"
     parameters = [
         (
             "mode",
@@ -392,7 +421,7 @@ class ListPlanTasksTool(BaseTool):
             None,
         ),
     ]
-    available_for_llm = True
+    available_for_llm = True  
 
     async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
         """执行查询计划任务列表。"""
@@ -424,8 +453,8 @@ class ListPlanTasksTool(BaseTool):
         """将任务列表格式化为可读文本。"""
         if not tasks:
             if mode == "all":
-                return "当前会话暂无任何计划任务"
-            return "当前会话暂无待处理计划任务"
+                return "**强调**: 当前会话暂无任何计划任务, 当前会话暂无任何计划任务"
+            return "**强调**: 当前会话暂无待处理计划任务, 当前会话暂无待处理计划任务"
 
         lines = [f"当前会话任务列表（{len(tasks)} 条，模式：{mode}）"]
         max_show = 20
@@ -1007,6 +1036,25 @@ class MaiPlanPlugin(BasePlugin):
         async with self._tasks_lock:
             document = self._read_tasks_document_unlocked()
             tasks = document["tasks"]
+
+            check_success, check_message, reasoning, model_name = await llm_api.generate_with_model(
+                f"你是任务匹配助手。请在“待处理任务列表”中找到与「{content}」基本相似的一条或多条重复任务，并仅返回该任务的 task_id。\n"
+                "输出规则：\n"
+                "1) 只能输出 task_id 本身；\n"
+                "2) 不要输出解释、前后缀、标点、换行或代码块；\n"
+                "3) 若没有明确匹配项，返回空字符串；\n"
+                f"待处理任务列表：{tasks}",
+                model_config.model_task_config.tool_use,
+                request_type="mai_only_you",
+            )
+
+            if check_success and check_message:
+                returned_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", check_message.strip()))
+                if not returned_ids:
+                    returned_ids = {check_message.strip()}
+                for task in tasks:
+                    if str(task.get("task_id", "")) in returned_ids:
+                        return False, f"创建失败：相同提醒已存在（任务ID：{task.get('task_id', '-')})", task
 
             for task in tasks:
                 if str(task.get("chat_id", "")) != chat_id:
