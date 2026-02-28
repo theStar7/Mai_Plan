@@ -407,6 +407,128 @@ class DeletePlanTaskTool(BaseTool):
             return {"name": self.name, "content": f"删除计划任务时发生错误：{exc}"}
 
 
+class ModifyPlanTaskTool(BaseTool):
+    """修改计划任务工具（供 LLM 调用）"""
+
+    name = "modify_plan_task_tool"
+    description = (
+        "根据用户提供的线索，在当前会话中修改一条待处理计划任务的内容和/或提醒时间。"
+        "线索可包含 task_id、任务内容关键词、提醒时间或相关事件信息。"
+        "适用于用户表达修改计划的意图，如更改提醒时间、更新任务描述等"
+    )
+    parameters = [
+        (
+            "task_content",
+            ToolParamType.STRING,
+            "要修改的任务关键词（task_id、内容、时间等），用于模糊匹配待处理任务列表中的目标任务",
+            True,
+            None,
+        ),
+        (
+            "new_content",
+            ToolParamType.STRING,
+            "新的任务内容描述（不修改内容则留空或不传）",
+            False,
+            None,
+        ),
+        (
+            "new_remind_time",
+            ToolParamType.STRING,
+            f"新的提醒时间，格式为 {DEFAULT_TIME_FORMAT}（不修改时间则留空或不传）",
+            False,
+            None,
+        ),
+    ]
+    available_for_llm = False #卧槽, 好像不需要这个工具也能修改任务!!!
+
+    async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
+        """根据任务关键词匹配并修改计划任务。"""
+        global _plugin_instance
+
+        if _plugin_instance is None:
+            return {"name": self.name, "content": "错误：Mai_Plan 插件未初始化"}
+
+        if not self.chat_stream or not self.chat_id:
+            return {"name": self.name, "content": "错误：无法获取当前会话信息"}
+
+        task_content = str(function_args.get("task_content", "")).strip()
+        if not task_content:
+            return {"name": self.name, "content": "错误：task_content 不能为空"}
+
+        new_content = str(function_args.get("new_content", "") or "").strip() or None
+        new_remind_time = str(function_args.get("new_remind_time", "") or "").strip() or None
+
+        if not new_content and not new_remind_time:
+            return {
+                "name": self.name,
+                "content": "错误：至少需要提供 new_content 或 new_remind_time 中的一项",
+            }
+
+        try:
+            # 在锁外完成 list_tasks 和 LLM 匹配，避免长时间持锁
+            tasks = await _plugin_instance.list_tasks(
+                chat_id=self.chat_id,
+                include_done=False,
+            )
+
+            if not tasks:
+                return {
+                    "name": self.name,
+                    "content": "当前会话暂无待处理任务，无法修改",
+                }
+
+            matched: List[Dict[str, Any]] = []
+            llm_success, llm_content, reasoning, model_name = await llm_api.generate_with_model(
+                f"你是任务匹配助手。请在\u201c待处理任务列表\u201d中找到与关键词「{task_content}」对应的一条任务，并仅返回该任务的 task_id。\n"
+                "输出规则：\n"
+                "1) 只能输出 task_id 本身；\n"
+                "2) 不要输出解释、前后缀、标点、换行或代码块；\n"
+                "3) 若没有明确匹配项，返回空字符串；\n"
+                "4) 若有多条匹配，用空格分隔所有 task_id；\n"
+                f"待处理任务列表：{tasks}",
+                model_config.model_task_config.tool_use,
+                request_type="mai_only_you",
+            )
+            if llm_success and llm_content:
+                returned_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", llm_content.strip()))
+                if not returned_ids:
+                    returned_ids = {llm_content.strip()}
+                matched = [
+                    task
+                    for task in tasks
+                    if str(task.get("task_id", "")) in returned_ids
+                ]
+
+            if not matched:
+                return {
+                    "name": self.name,
+                    "content": f"未找到与「{task_content}」匹配的待处理任务，修改失败。请提供更准确的任务信息（如完整的任务内容、提醒时间或 task_id）",
+                }
+
+            if len(matched) > 1:
+                lines = [f"找到 {len(matched)} 条匹配任务，无法确定修改目标，请提供更精确的关键词："]
+                for idx, task in enumerate(matched, start=1):
+                    tid = str(task.get("task_id", "-"))
+                    tcontent = str(task.get("content", "-"))
+                    tremind = str(task.get("remind_at", "-"))
+                    lines.append(f"{idx}. [{tid}] {tcontent} | {tremind}")
+                return {"name": self.name, "content": "\n".join(lines)}
+
+            target = matched[0]
+            target_task_id = str(target.get("task_id", ""))
+
+            success, text = await _plugin_instance.update_task(
+                chat_id=self.chat_id,
+                task_id=target_task_id,
+                new_content=new_content,
+                new_remind_time_str=new_remind_time,
+            )
+            return {"name": self.name, "content": text}
+        except Exception as exc:
+            logger.error(f"[Mai_Plan] ModifyPlanTaskTool 执行异常：{exc}")
+            return {"name": self.name, "content": f"修改计划任务时发生错误：{exc}"}
+
+
 class ListPlanTasksTool(BaseTool):
     """查询计划任务列表工具（供 LLM 调用）"""
 
@@ -538,7 +660,7 @@ class MaiPlanStopHandler(BaseEventHandler):
 
 @register_plugin
 class MaiPlanPlugin(BasePlugin):
-    """Mai_Plan 插件：自动创建计划任务并定时提醒"""
+    """Mai_Plan 插件：智能日程管家，自动识别聊天待办并准时提醒"""
 
     plugin_name = "mai_plan_plugin"
     enable_plugin = True
@@ -621,6 +743,7 @@ class MaiPlanPlugin(BasePlugin):
             (MaiPlanStopHandler.get_handler_info(), MaiPlanStopHandler),
             (CreatePlanTaskTool.get_tool_info(), CreatePlanTaskTool),
             (DeletePlanTaskTool.get_tool_info(), DeletePlanTaskTool),
+            (ModifyPlanTaskTool.get_tool_info(), ModifyPlanTaskTool),
             (ListPlanTasksTool.get_tool_info(), ListPlanTasksTool),
         ]
 
@@ -1187,6 +1310,86 @@ class MaiPlanPlugin(BasePlugin):
             self._write_tasks_document_unlocked(document)
 
         return True, f"已取消任务 {task_id}"
+
+    async def update_task(
+        self,
+        chat_id: str,
+        task_id: str,
+        new_content: Optional[str] = None,
+        new_remind_time_str: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """
+        修改一个待处理任务的内容和/或提醒时间。
+        仅允许修改状态为 pending 的任务。
+
+        Args:
+            chat_id: 会话 ID
+            task_id: 任务 ID
+            new_content: 新的任务内容（None 表示不修改）
+            new_remind_time_str: 新的提醒时间字符串（None 表示不修改）
+
+        Returns:
+            Tuple[bool, str]: (成功标志, 结果信息)
+        """
+        if not task_id:
+            return False, "修改失败：task_id 不能为空"
+
+        if not new_content and not new_remind_time_str:
+            return False, "修改失败：至少需要提供新的任务内容或新的提醒时间"
+
+        # 若提供了新时间，先在锁外完成解析校验
+        new_remind_dt: Optional[datetime] = None
+        if new_remind_time_str:
+            new_remind_dt, parse_error = self._parse_remind_datetime(new_remind_time_str)
+            if new_remind_dt is None:
+                return False, f"修改失败：{parse_error}"
+
+            min_future_seconds = self._safe_int(
+                self.get_config("scheduler.min_future_seconds", 30), 30, 0
+            )
+            if new_remind_dt.timestamp() < time.time() + min_future_seconds:
+                return False, f"修改失败：新的提醒时间必须晚于当前时间至少 {min_future_seconds} 秒"
+
+        async with self._tasks_lock:
+            document = self._read_tasks_document_unlocked()
+            tasks = document["tasks"]
+
+            target_task: Optional[Dict[str, Any]] = None
+            for task in tasks:
+                if str(task.get("chat_id", "")) == chat_id and str(task.get("task_id", "")) == task_id:
+                    target_task = task
+                    break
+
+            if target_task is None:
+                return False, f"修改失败：未找到任务 {task_id}"
+
+            status = str(target_task.get("status", ""))
+            if status != TASK_STATUS_PENDING:
+                status_text = self.status_to_text(status)
+                return False, f"修改失败：任务 {task_id} 当前状态为「{status_text}」，仅待提醒任务可修改"
+
+            changes: List[str] = []
+            old_content = str(target_task.get("content", ""))
+            old_remind_at = str(target_task.get("remind_at", ""))
+
+            if new_content:
+                target_task["content"] = new_content
+                changes.append(f"内容：{old_content} → {new_content}")
+
+            if new_remind_dt is not None:
+                new_remind_at = new_remind_dt.strftime(DEFAULT_TIME_FORMAT)
+                target_task["remind_at"] = new_remind_at
+                target_task["remind_ts"] = new_remind_dt.timestamp()
+                changes.append(f"提醒时间：{old_remind_at} → {new_remind_at}")
+
+            target_task["updated_at"] = self._format_now()
+
+            # 重新按提醒时间排序
+            tasks.sort(key=lambda item: float(item.get("remind_ts", 0.0)))
+            self._write_tasks_document_unlocked(document)
+
+        change_detail = "；".join(changes)
+        return True, f"已修改任务 {task_id}：{change_detail}"
 
     async def start_scheduler(self) -> None:
         """

@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "麦麦计划表(Mai_Plan)",
   "version": "0.2.0",
-  "description": "基于日程提醒的自动化插件，可根据聊天内容自动创建计划任务，并在指定时间提醒用户。",
+  "description": "告别遗忘，让计划井井有条！麦麦化身您的智能日程管家，精准捕捉闲聊中的待办事项。无论是重要计划还是生活琐事，只需自然提及，即可自动创建任务并准时提醒。",
   "author": {
     "name": "theStar7",
     "url": "https://github.com/theStar7"
@@ -14,11 +14,9 @@
   "homepage_url": "https://github.com/theStar7/Mai_Plan",
   "repository_url": "https://github.com/theStar7/Mai_Plan",
   "keywords": [
-    "chat",
-    "qq",
-    "proactive",
-    "memory",
-    "context"
+    "自动提醒",
+    "日程计划",
+    "记录"
   ],
   "categories": [
     "Utility Tools",
