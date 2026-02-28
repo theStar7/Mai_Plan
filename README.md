@@ -1,42 +1,91 @@
-# Mai_Plan 插件
+# Mai_Plan (麦麦计划表)
 
-面向 MaiBot 的日程提醒插件：从聊天内容自动创建计划任务，并在指定时间提醒。
+**Mai_Plan** 是面向 MaiBot 的智能日程提醒插件。它不仅能听懂你的显式指令，还能敏锐捕捉闲聊中的未来安排、重要时刻或模糊约定，自动为你创建计划并在合适的时间发出提醒。
 
-## 功能
-- 自动创建计划任务（由 Planner 触发 action）
-- 定时提醒（支持失败重试）
-- 任务管理命令：查看/取消
-- 本地持久化任务数据
+告别遗忘，让麦麦成为你的贴身日程管家。
 
-## 依赖与适配
-- 适配 MaiBot `>= 0.12.1`
-- 当前无额外 Python 依赖
+## ✨ 核心功能 (Features)
 
-## 使用方式
-### 自动创建
-当用户表达未来提醒诉求时，Planner 会调用 action `create_plan_task`，并传入参数：
-- `task_content`: 任务内容
-- `remind_time`: 绝对时间字符串，格式 `YYYY-MM-DD HH:MM:SS`
+### 1. 智能计划感知
+插件不仅仅是被动记录，更能主动识别多种场景：
+- **明确提醒**：直接处理“提醒我明天开会”、“周五晚上8点去拿快递”等指令。
+- **模糊时间推断**：当你说“明天下午去玩”时，自动推算合理的提醒时间（如 14:00）。
+- **重要时刻以备**：识别生日、纪念日、考试等话题，并在前一晚或当天早晨主动安排关怀提醒。
+- **公共事件跟进**：提及游戏发售、电影上映时，自动创建提醒以便届时跟进讨论。
+- **话题延续**：当聊天中断说“下次再聊”时，尝试安排续聊提醒，让话题不掉地。
 
-### 命令
-- `/mai_plan list [pending|all]` 查看当前会话任务
-- `/mai_plan cancel <task_id>` 取消任务
+### 2. 多维度任务管理
+- **自动创建**：基于 LLM 的语义理解，自动提取任务内容与时间。
+- **命令管理**：提供指令即时查看或取消任务。
+- **本地持久化**：任务数据安全存储于本地，重启不丢失。
 
-## 配置
-配置文件为 [config.toml](config.toml)。常用配置如下：
+### 3. 灵活的提醒机制
+- **定时发送**：通过后台调度器准时推送提醒。
+- **重试机制**：发送失败自动重试，确保消息触达。
+- **多场景支持**：支持群聊与私聊，可配置不同的生效范围。
 
-- `scope.group` 是否在群聊生效
-- `scope.private` 是否在私聊生效
-- `time.format` 时间格式，默认 `"%Y-%m-%d %H:%M:%S"`
-- `scheduler.tick_seconds` 扫描间隔（秒）
-- `scheduler.min_future_seconds` 最小提前创建秒数
-- `reminder.send_mode` 提醒发送模式：`origin_chat` / `private_first`
-- `reminder.prefix` 提醒消息前缀
-- `permission.admin_user_ids` 管理员用户 ID 列表
+---
 
-## 数据存储
-任务文件默认存储为 [plan_tasks.json](plan_tasks.json)。结构示例：
+## 📖 使用说明 (Usage)
 
+### 自然语言交互 (推荐)
+你不需要记忆复杂的指令，只需像往常一样聊天：
+
+> **用户**：麦麦，提醒我明早9点提交周报。  
+> **Mai_Plan**：好的，已为您创建计划：[提交周报]，将在 2026-03-01 09:00:00 提醒您。
+
+> **用户**：下周五就是我生日了！  
+> **Mai_Plan**：(自动记录，并可能在周四晚或周五早晨提醒祝贺)
+
+> **用户**：这事太复杂了，改天再聊吧。  
+> **Mai_Plan**：(自动创建一个未来的“续聊”提醒)
+
+### 指令控制
+插件提供了一组管理命令，用于查询和控制任务状态。
+
+| 命令 | 参数 | 说明 | 示例 |
+| :--- | :--- | :--- | :--- |
+| `/mai_plan list` | `[pending\|all]` | 查看任务列表。<br>`pending`: 仅待办(默认)<br>`all`: 所有历史 | `/mai_plan list` |
+| `/mai_plan cancel` | `<task_id>` | 取消指定 ID 的任务 | `/mai_plan cancel p_20260228_a1b2` |
+
+---
+
+## ⚙️ 配置说明 (Configuration)
+
+配置文件位于插件目录下的 `config.toml`。首次运行会自动生成默认配置。
+
+```toml
+[scope]
+group = true        # 是否在群聊中启用
+private = true      # 是否在私聊中启用
+
+[time]
+format = "%Y-%m-%d %H:%M:%S" # 内部时间格式
+
+[scheduler]
+tick_seconds = 30           # 扫描任务的频率(秒)
+min_future_seconds = 60     # 创建任务时，允许的最小提前量
+
+[reminder]
+send_mode = "origin_chat"   # 提醒发送模式: origin_chat(原路返回) / private_first(优先私聊)
+prefix = "⏰ [计划提醒]"     # 提醒消息的前缀
+notify_on_create = true     # 创建成功时是否发送提示消息
+
+[permission]
+admin_user_ids = []         # 管理员ID列表，拥有取消任意任务的权限
+```
+
+## 🛠️ 安装与依赖
+
+1. 确保 MaiBot 版本 `>= 0.12.1`。
+2. 将本插件文件夹放入 `MaiBot/plugins/` 目录。
+3. 重启 MaiBot，插件将自动加载。
+4. 本插件依赖 MaiBot 核心环境，**无需**安装额外 Python 包。
+
+## 💾 数据存储
+任务数据默认存储在 `plan_tasks.json` 文件中。包含任务 ID、内容、提醒时间及当前状态（pending/sent/failed/cancelled）。
+历史任务储存在 `plan_tasks_history.json` 中。
+详细结构示例：
 ```json
 {
   "version": "1.0.0",
@@ -61,4 +110,5 @@
 ## 权限规则
 - 任务创建者可取消自己的任务
 - 管理员（`permission.admin_user_ids`）可取消任意任务
+
 
