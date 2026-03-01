@@ -1,8 +1,8 @@
 {
   "manifest_version": 1,
   "name": "麦麦计划表(Mai_Plan)",
-  "version": "0.2.0",
-  "description": "告别遗忘，让计划井井有条！麦麦化身您的智能日程管家，精准捕捉闲聊中的待办事项。无论是重要计划还是生活琐事，只需自然提及，即可自动创建任务并准时提醒。",
+  "version": "0.3.0",
+  "description": "告别遗忘，让计划井井有条！麦麦化身您的智能日程管家，精准捕捉闲聊中的待办事项。支持一次性提醒和基于 cron 表达式的循环日程，无论是重要计划还是日常打卡，只需自然提及即可自动创建并准时提醒。",
   "author": {
     "name": "theStar7",
     "url": "https://github.com/theStar7"
@@ -14,8 +14,8 @@
   "homepage_url": "https://github.com/theStar7/Mai_Plan",
   "repository_url": "https://github.com/theStar7/Mai_Plan",
   "keywords": [
-    "自动提醒",
     "日程计划",
+    "自动提醒",
     "记录"
   ],
   "categories": [
@@ -75,7 +75,9 @@
       "定时触发自动提醒",
       "支持查看和取消任务",
       "任务文件本地持久化",
-      "支持 LLM 工具调用（创建/修改/删除/查询任务）"
+      "支持 LLM 工具调用（创建/修改/删除/查询任务）",
+      "基于 cron 表达式的循环日程（每天/每周/每月/自定义周期）",
+      "APScheduler 事件驱动调度，低开销高精度"
     ]
   },
   "id": "Mai_Plan"

@@ -6,9 +6,13 @@ import re
 import shutil
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from src.chat.message_receive.chat_stream import get_chat_manager
 from src.plugin_system.apis import llm_api
@@ -58,17 +62,40 @@ class CreatePlanTaskAction(BaseAction):
     action_parameters = {
         "topic": "内容的性质(如提醒计划、未来话题等)，由根据聊天内容进行提取和判断",
         "task_content": "提醒,任务,记忆或话题的具体内容",
-        "remind_time": f"未来的回忆时间 或 调用提醒的时间，格式 {DEFAULT_TIME_FORMAT}",
+        "remind_time": f"未来的回忆时间 或 调用提醒的时间，格式 {DEFAULT_TIME_FORMAT}（循环任务可留空）",
+        "is_recurring": "是否为循环任务（true/false），当用户表达周期性提醒需求时设为 true",
+        "cron_expr": "5段cron表达式（分 时 日 月 星期），仅循环任务需要。示例: 0 8 * * * 表示每天08:00",
     }
     action_require = [
-        "当用户明确表达提醒、日程、待办诉求时使用（如“提醒我明天开会”）",
+        "当用户明确表达提醒、日程、待办诉求时使用（如'提醒我明天开会'、'2小时后叫我'、'半小时后提醒'等，包括绝对时间和相对时间间隔）",
+        "相对时间处理：当用户说'X分钟后''X小时后'等相对时间时，必须调用此action，将相对时间加上当前时间换算为绝对时间。",
         "智能推算：当感知到对方即将经历重要时刻（生日、纪念日、考试、出行、聚会等），主动安排在适当时机发送关怀或祝福（时间模糊时自行设定合理时刻，如生日前一晚20:00或当天08:00）。",
         "模糊时间处理：当对方提到未来某段时间发生某事（如'明天下午去玩'），即使时间模糊，也必须主动推算出一个具体时刻（如'明天晚上20:00'）并创建计划来询问情况，而不仅仅是记录。",
         "公共事件：当提及用户感兴趣的未来公共事件（电影上映、游戏发售、比赛开始等）时，主动创建提醒以便届时跟进讨论。",
         "话题延续：当聊天话题聊到一半、对方说'下次再聊'或'改天继续'时，主动安排具体时间的续聊提醒。",
         "如果已经存在相同内容和时间的计划任务, 则不重复创建",
+        "当用户表达周期性需求（每天、每周、每月等），使用 is_recurring=true 并提供 cron_expr",
     ]
     #associated_types = ["text"]
+
+    @staticmethod
+    def _extract_bool(data: dict, key: str) -> bool:
+        """从 action_data 中提取布尔值。"""
+        val = data.get(key)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() in {"true", "1", "yes"}
+        return False
+
+    @staticmethod
+    def _extract_str(data: dict, key: str) -> "Optional[str]":
+        """从 action_data 中提取非空字符串，空则返回 None。"""
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        return None
+
 
     async def execute(self) -> Tuple[bool, str]:
         """
@@ -90,11 +117,13 @@ class CreatePlanTaskAction(BaseAction):
 
         task_content = _plugin_instance.extract_task_content(self.action_data)
         remind_time = _plugin_instance.extract_remind_time(self.action_data)
+        is_recurring = self._extract_bool(self.action_data, "is_recurring")
+        cron_expr = self._extract_str(self.action_data, "cron_expr")
 
-        if not task_content or not remind_time:
-            error_text = "创建计划任务失败：缺少 task_content 或 remind_time"
-            # if _plugin_instance.get_config("reminder.notify_on_create_fail", False):
-            #     await self.send_text(error_text)
+        if not task_content:
+            return False, "创建计划任务失败：缺少 task_content"
+        if not is_recurring and not remind_time:
+            error_text = "创建计划任务失败：一次性任务缺少 remind_time"
             return False, error_text
 
         source_message_id = ""
@@ -110,6 +139,8 @@ class CreatePlanTaskAction(BaseAction):
             source_message_id=source_message_id,
             platform=str(self.platform or ""),
             is_group=self.is_group,
+            is_recurring=is_recurring,
+            cron_expr=cron_expr,
         )
 
         if success:
@@ -238,7 +269,12 @@ class MaiPlanCommand(BaseCommand):
             content = str(task.get("content", "-"))
             remind_at = str(task.get("remind_at", "-"))
             status_text = MaiPlanPlugin.status_to_text(str(task.get("status", "")))
-            lines.append(f"{index}. [{task_id}] {content} | {remind_at} | {status_text}")
+            if bool(task.get("is_recurring", False)):
+                cron_desc = MaiPlanPlugin._describe_cron(str(task.get("cron_expr", "")))
+                occ = task.get("occurrence_count", 0)
+                lines.append(f"{index}. \U0001f501 [{task_id}] {content} | {cron_desc} | 下次: {remind_at} | 已触发{occ}次")
+            else:
+                lines.append(f"{index}. [{task_id}] {content} | {remind_at} | {status_text}")
 
         if len(tasks) > max_show:
             lines.append(f"... 还有 {len(tasks) - max_show} 条任务未显示")
@@ -247,37 +283,61 @@ class MaiPlanCommand(BaseCommand):
 
 
 class CreatePlanTaskTool(BaseTool):
-    """创建计划任务工具（供 LLM 调用）"""
+    """创建计划任务工具（供 LLM 调用），支持一次性和循环任务"""
 
     name = "create_plan_task_tool"
     description = (
-        "核心功能：创建未来的计划提醒或主动关怀任务。触发场景：\n"
-        "1. 【响应指令】用户明确要求提醒、安排日程或待办事项时（如“明天早上叫我”）。\n"
-        "2. 【智能关怀】从对话中感知到用户未来有重要事件（生日、考试、出行、纪念日、工作汇报等），即使时间描述模糊，也应主动根据事件性质推算合适的时间点创建任务。\n"
-        "   - 示例：用户说“明天是我的生日” -> 创建任务：[明早08:00] 祝用户生日快乐。\n"
-        "   - 示例：用户说“下周要去旅游” -> 创建任务：[出发前一晚20:00] 提醒带好证件/祝旅途愉快。\n"
-        "   - 示例：用户说“明天下午去面试” -> 创建任务：[面试结束后当天18:00] 询问面试情况如何。\n"
-        "3. 【话题跟进】当用户提及感兴趣的公共事件将在未来发生（如电影上映、游戏发售、球赛、新品发布会等），主动创建任务在事件发生日提醒或发起讨论。\n"
-        "   - 示例：用户说“《黑神话》下个月发售” -> 创建任务：[发售日当天10:00] 提醒用户游戏发售并询问是否购买。\n"
-        "4. 【话题延续】话题未尽或约定改天再聊时，创建任务在次日或约定时间主动发起续聊。\n"
-        "注意：task_content 必须是Bot到时候要执行的“具体行为描述”（说什么话/做什么事），而不仅仅是记录事件本身。"
+        "核心功能：创建未来的计划提醒或主动关怀任务，支持一次性和循环（cron）两种模式。触发场景：\n"
+        "1. 【响应指令】用户明确要求提醒、安排日程或待办事项时。包括：\n"
+        "   - 绝对时间：'明天早上8点提醒我'、'3月5号下午3点叫我'\n"
+        "   - 相对时间间隔：'2小时后提醒我'、'半小时后叫我'、'10分钟后提醒'——须根据当前时间自行换算为绝对时间填入 remind_time。\n"
+        "2. 【智能关怀】从对话中感知到用户未来有重要事件（生日、考试、出行等），主动推算时间创建任务。\n"
+        "3. 【话题跟进】用户提及未来公共事件（电影上映、游戏发售等），主动创建提醒。\n"
+        "4. 【话题延续】话题未尽或约定改天再聊时，创建续聊任务。\n"
+        "5. 【循环日程】用户表达周期性的循环提醒需求时，设置 is_recurring=true 并提供 cron 表达式。\n"
+        # "重要： 对“X分钟后/X小时后/X天后”这类相对时间，在确认存在提醒意图后，优先调用工具并换算为绝对 remind_time。"
+        "注意：task_content 必须是Bot到时候要执行的'具体行为描述'（说什么话/做什么事），而不仅仅是记录事件本身。"
     )
     parameters = [
         (
             "task_content",
             ToolParamType.STRING,
-            "Bot在提醒时间点需要执行的具体行为描述。必须是第一人称视角的行动指令，例如：“祝那个谁生日快乐，并问他愿望是什么”、“提醒用户《某电影》今天上映，问他打不打算看”、“询问用户今天下午的面试顺不顺利”。严禁只写“用户生日”或“电影上映”这种名词。",
+            "Bot在提醒时间点需要执行的具体行为描述。必须是第一人称视角的行动指令。严禁只写名词。",
             True,
             None,
         ),
         (
             "remind_time",
             ToolParamType.STRING,
-            f"触发任务的准确时间点，格式必须为 {DEFAULT_TIME_FORMAT}，例如 2026-03-01 09:00:00。若用户只有模糊时间（如“明天下午”、“下周”），请根据事件性质智能推算一个合理的具体时刻（例如：早安问候选08:00，晚安/关怀选21:00，事后询问选事件结束后的时间）。",
-            True,
+            f"触发任务的准确时间点，格式为 {DEFAULT_TIME_FORMAT}。一次性任务必填；循环任务可留空（首次触发由 cron 自动计算）。当用户使用相对时间（如'2小时后''30分钟后'）时，须自行将当前时间加上间隔后填入此字段。",
+            False,
             None,
         ),
         ("creator_name", ToolParamType.STRING, "创建者名称（可从上下文获取）", False, None),
+        (
+            "is_recurring",
+            ToolParamType.BOOLEAN,
+            "是否为循环任务。若用户表达周期性提醒需求则设为 true，否则 false（默认）。",
+            False,
+            None,
+        ),
+        (
+            "cron_expr",
+            ToolParamType.STRING,
+            "5段标准cron表达式（分 时 日 月 星期），仅 is_recurring=true 时必填。"
+            "特殊符号：* 任意值, , 列举, - 范围, / 步长, last 最后。"
+            "常见示例：\n"
+            "  每天08:00 → 0 8 * * *\n"
+            "  工作日09:30 → 30 9 * * 1-5\n"
+            "  每周一14:00 → 0 14 * * 1\n"
+            "  每月1日10:00 → 0 10 1 * *\n"
+            "  每30分钟 → */30 * * * *\n"
+            "  每2小时整点 → 0 */2 * * *\n"
+            "  每年1月1日 → 0 0 1 1 *\n"
+            "  每季度首日 → 0 10 1 1,4,7,10 *",
+            False,
+            None,
+        ),
     ]
     available_for_llm = True
 
@@ -294,11 +354,15 @@ class CreatePlanTaskTool(BaseTool):
         task_content = str(function_args.get("task_content", "")).strip()
         remind_time = str(function_args.get("remind_time", "")).strip()
         creator_name = str(function_args.get("creator_name", "")).strip() or "未知用户"
+        is_recurring = bool(function_args.get("is_recurring", False))
+        cron_expr = str(function_args.get("cron_expr", "") or "").strip() or None
 
         if not task_content:
             return {"name": self.name, "content": "错误：task_content 不能为空"}
-        if not remind_time:
-            return {"name": self.name, "content": "错误：remind_time 不能为空"}
+        if not is_recurring and not remind_time:
+            return {"name": self.name, "content": "错误：一次性任务必须提供 remind_time"}
+        if is_recurring and not cron_expr:
+            return {"name": self.name, "content": "错误：循环任务必须提供 cron_expr"}
 
         platform = str(getattr(self.chat_stream, "platform", "") or "")
         is_group = bool(getattr(self.chat_stream, "is_group", False))
@@ -313,6 +377,8 @@ class CreatePlanTaskTool(BaseTool):
                 source_message_id="",
                 platform=platform,
                 is_group=is_group,
+                is_recurring=is_recurring,
+                cron_expr=cron_expr,
             )
             return {"name": self.name, "content": reply_text}
         except Exception as exc:
@@ -325,9 +391,10 @@ class DeletePlanTaskTool(BaseTool):
 
     name = "delete_plan_task_tool"
     description = (
-        "根据用户提供的线索，在当前会话中取消删除待处理计划任务。"
-        "线索可包含 task_id、任务内容关键词、提醒时间或相关事件信息。"
-        "适用于用户表达取消计划的意图，或用户提到相关事件已发生无需提醒时，主动取消相关计划任务"
+        "用于取消当前会话中的待处理计划任务。"
+        "仅在用户明确表达取消意图时调用，例如“取消提醒”“不用提醒了”“删掉这个计划”，或明确表示相关事件已发生且无需再提醒。"
+        "匹配线索可包含 task_id、任务内容关键词、提醒时间或事件信息，优先使用 task_id。"
+        "以下场景不应调用本工具：仅查询任务列表（应使用 list_plan_tasks_tool）、修改任务内容/时间（应使用 modify_plan_task_tool）、纯讨论或假设语句。"
     )
     parameters = [
         (
@@ -451,8 +518,15 @@ class ModifyPlanTaskTool(BaseTool):
             False,
             None,
         ),
+        (
+            "new_cron_expr",
+            ToolParamType.STRING,
+            "新的5段cron表达式（仅循环任务可用，不修改则留空或不传）",
+            False,
+            None,
+        ),
     ]
-    available_for_llm = True # 启用修改工具
+    available_for_llm = True  # 启用修改工具
 
     async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
         """根据任务关键词匹配并修改计划任务。"""
@@ -470,11 +544,12 @@ class ModifyPlanTaskTool(BaseTool):
 
         new_content = str(function_args.get("new_content", "") or "").strip() or None
         new_remind_time = str(function_args.get("new_remind_time", "") or "").strip() or None
+        new_cron_expr = str(function_args.get("new_cron_expr", "") or "").strip() or None
 
-        if not new_content and not new_remind_time:
+        if not new_content and not new_remind_time and not new_cron_expr:
             return {
                 "name": self.name,
-                "content": "错误：至少需要提供 new_content 或 new_remind_time 中的一项",
+                "content": "错误：至少需要提供 new_content、new_remind_time 或 new_cron_expr 中的一项",
             }
 
         try:
@@ -535,6 +610,7 @@ class ModifyPlanTaskTool(BaseTool):
                 task_id=target_task_id,
                 new_content=new_content,
                 new_remind_time_str=new_remind_time,
+                new_cron_expr=new_cron_expr,
             )
             return {"name": self.name, "content": text}
         except Exception as exc:
@@ -546,7 +622,12 @@ class ListPlanTasksTool(BaseTool):
     """查询计划任务列表工具（供 LLM 调用）"""
 
     name = "list_plan_tasks_tool"
-    description = "适用于查询当前会话中的计划任务列表，可选择查看全部或仅待处理任务"
+    description = ( 
+                    "使用于需要结合当前会话的计划任务列表来进行推理或生成时调用，返回当前会话的计划任务列表信息。"
+                    "适用于查询当前会话中的计划任务列表，可选择查看全部或仅待处理任务"
+                    "适用于当用户表达查询计划任务的意图时调用，例如“我有哪些提醒”“列出我的计划”“还有什么待办”等"
+                    "以下场景不应调用本工具：取消或删除任务（应使用 delete_plan_task_tool）、修改任务内容/时间（应使用 modify_plan_task_tool）、创建新的提醒任务（应使用 create_plan_task_tool）"
+                   )
     parameters = [
         (
             "mode",
@@ -606,7 +687,12 @@ class ListPlanTasksTool(BaseTool):
                 TASK_STATUS_CANCELLED: "已取消",
             }
             status_text = status_map.get(status, status or "未知")
-            lines.append(f"{index}. [{task_id}] {content} | {remind_at} | {status_text}")
+            if bool(task.get("is_recurring", False)):
+                cron_desc = MaiPlanPlugin._describe_cron(str(task.get("cron_expr", "")))
+                occ = task.get("occurrence_count", 0)
+                lines.append(f"{index}. \U0001f501 [{task_id}] {content} | {cron_desc} | 下次: {remind_at} | 已触发{occ}次")
+            else:
+                lines.append(f"{index}. [{task_id}] {content} | {remind_at} | {status_text}")
 
         if len(tasks) > max_show:
             lines.append(f"... 还有 {len(tasks) - max_show} 条任务未显示")
@@ -678,17 +764,17 @@ class MaiPlanPlugin(BasePlugin):
     plugin_name = "mai_plan_plugin"
     enable_plugin = True
     dependencies: List[str] = []
-    python_dependencies: List[str] = []
+    python_dependencies: List[str] = ["apscheduler>=3.10,<4"]
     config_file_name = "config.toml"
 
     config_section_descriptions = {
         "plugin": "插件基础配置",
         "scope": "会话范围配置",
         "time": "时间格式配置",
-        "scheduler": "调度器配置",
         "reminder": "提醒文案与发送策略",
         "storage": "任务存储配置",
         "permission": "权限配置",
+        "recurring": "循环任务配置",
     }
 
     config_schema: Dict[str, Dict[str, ConfigField]] = {
@@ -703,12 +789,6 @@ class MaiPlanPlugin(BasePlugin):
         "time": {
             "format": ConfigField(type=str, default=DEFAULT_TIME_FORMAT, description="任务时间格式"),
         },
-        "scheduler": {
-            "tick_seconds": ConfigField(type=int, default=10, description="扫描间隔（秒）"),
-            "min_future_seconds": ConfigField(type=int, default=30, description="最小提前创建秒数"),
-            "max_batch_per_tick": ConfigField(type=int, default=10, description="每轮最大提醒数量"),
-            "max_retry_count": ConfigField(type=int, default=3, description="提醒发送最大重试次数"),
-        },
         "reminder": {
             "send_mode": ConfigField(
                 type=str,
@@ -716,14 +796,16 @@ class MaiPlanPlugin(BasePlugin):
                 description="提醒发送模式",
                 choices=["origin_chat", "private_first"],
             ),
-            "prefix": ConfigField(type=str, default="⏰ 日程提醒", description="提醒消息前缀"),
-            "notify_on_create_fail": ConfigField(type=bool, default=False, description="创建失败是否发送提示"),
+            "prefix": ConfigField(type=str, default="日程提醒", description="提醒消息前缀"),
         },
         "storage": {
             "tasks_file_name": ConfigField(type=str, default="plan_tasks.json", description="任务文件名"),
         },
         "permission": {
             "admin_user_ids": ConfigField(type=list, default=[], description="管理员用户 ID 列表"),
+        },
+        "recurring": {
+            "max_recurring_per_chat": ConfigField(type=int, default=10, description="每个会话最大循环任务数"),
         },
         "Others": {
             "save_plan_history": ConfigField(type=bool, default=True, description="任务完成后是否将记录归档到 plan_history.json（否则直接删除）"),
@@ -733,13 +815,13 @@ class MaiPlanPlugin(BasePlugin):
     def __init__(self, *args, **kwargs):
         """
         初始化插件实例。
-        创建任务读写锁和调度器任务引用。
+        创建任务读写锁和 APScheduler 调度器引用。
         """
         global _plugin_instance
 
         super().__init__(*args, **kwargs)
         self._tasks_lock = asyncio.Lock()
-        self._scheduler_task: Optional[asyncio.Task] = None
+        self._scheduler: Optional[AsyncIOScheduler] = None
         _plugin_instance = self
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
@@ -983,6 +1065,335 @@ class MaiPlanPlugin(BasePlugin):
         history.append(archived)
         self._write_history_unlocked(history)
 
+    # ──────────────────────────────────────────────────────────
+    #  Cron / 循环任务 辅助方法
+    # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_cron_expr(expr: str) -> Tuple[bool, str]:
+        """
+        校验 cron 表达式是否合法。
+        利用 APScheduler 的 CronTrigger.from_crontab 进行校验。
+
+        Args:
+            expr: 5 段 cron 表达式（分 时 日 月 星期）
+
+        Returns:
+            Tuple[bool, str]: (是否合法, 错误信息（合法时为空字符串）)
+        """
+        expr = (expr or "").strip()
+        if not expr:
+            return False, "cron 表达式不能为空"
+        try:
+            CronTrigger.from_crontab(expr)
+            return True, ""
+        except (ValueError, KeyError) as e:
+            return False, f"cron 表达式无效：{e}"
+
+    @staticmethod
+    def _build_cron_trigger(cron_expr: str) -> CronTrigger:
+        """
+        根据 cron 表达式构建 CronTrigger 实例。
+
+        Args:
+            cron_expr: 5 段 cron 表达式
+
+        Returns:
+            CronTrigger: APScheduler 触发器实例
+
+        Raises:
+            ValueError: 表达式非法
+        """
+        return CronTrigger.from_crontab(cron_expr.strip())
+
+    @staticmethod
+    def _describe_cron(expr: str) -> str:
+        """
+        将 cron 表达式翻译为简洁中文描述。
+        覆盖常见模式，其余 fallback 到原始 cron 显示。
+
+        Args:
+            expr: 5 段 cron 表达式
+
+        Returns:
+            str: 人类可读的中文描述
+        """
+        expr = (expr or "").strip()
+        if not expr:
+            return "未知"
+
+        parts = expr.split()
+        if len(parts) != 5:
+            return f"cron({expr})"
+
+        minute, hour, day, month, dow = parts
+
+        weekday_names = {
+            "0": "日", "7": "日", "1": "一", "2": "二",
+            "3": "三", "4": "四", "5": "五", "6": "六",
+            "sun": "日", "mon": "一", "tue": "二", "wed": "三",
+            "thu": "四", "fri": "五", "sat": "六",
+        }
+
+        def _format_time(h: str, m: str) -> str:
+            """格式化小时和分钟为 HH:MM。"""
+            try:
+                return f"{int(h):02d}:{int(m):02d}"
+            except (ValueError, TypeError):
+                return f"{h}:{m}"
+
+        def _describe_weekdays(dow_str: str) -> Optional[str]:
+            """尝试将星期字段翻译为中文。"""
+            if dow_str == "1-5":
+                return "工作日"
+            if dow_str == "0,6" or dow_str == "6,0" or dow_str == "6,7":
+                return "周末"
+            # 逗号分隔
+            raw_parts = dow_str.split(",")
+            names = []
+            for p in raw_parts:
+                name = weekday_names.get(p.strip().lower())
+                if name is None:
+                    return None
+                names.append(name)
+            if names:
+                return "每周" + "".join(names)
+            return None
+
+        try:
+            # 模式: */N * * * *  →  每 N 分钟
+            m_step = re.match(r"^\*/(\d+)$", minute)
+            if m_step and hour == "*" and day == "*" and month == "*" and dow == "*":
+                return f"每 {m_step.group(1)} 分钟"
+
+            # 模式: M */N * * *  →  每 N 小时的第 M 分
+            h_step = re.match(r"^\*/(\d+)$", hour)
+            if h_step and day == "*" and month == "*" and dow == "*":
+                n = h_step.group(1)
+                if minute == "0":
+                    return f"每 {n} 小时整点"
+                return f"每 {n} 小时的第 {minute} 分"
+
+            # 模式: M H-H/N * * *  →  H:00~H:00 每 N 小时
+            h_range_step = re.match(r"^(\d+)-(\d+)/(\d+)$", hour)
+            if h_range_step and day == "*" and month == "*" and dow == "*":
+                h_start, h_end, h_interval = h_range_step.groups()
+                return f"{int(h_start):02d}:00~{int(h_end):02d}:00 每 {h_interval} 小时"
+
+            # 简单固定时间的模式
+            is_fixed_time = re.match(r"^\d+$", minute) and re.match(r"^\d+$", hour)
+            # 逗号分隔小时: M H,H,H * * *
+            is_multi_hour = re.match(r"^\d+$", minute) and re.match(r"^[\d,]+$", hour) and "," in hour
+
+            if is_multi_hour and day == "*" and month == "*" and dow == "*":
+                hours = hour.split(",")
+                times = ", ".join(_format_time(h, minute) for h in hours)
+                return f"每天 {times}"
+
+            if is_fixed_time:
+                time_str = _format_time(hour, minute)
+
+                # M H * * *  →  每天 HH:MM
+                if day == "*" and month == "*" and dow == "*":
+                    return f"每天 {time_str}"
+
+                # M H * * dow  →  每周X HH:MM
+                if day == "*" and month == "*" and dow != "*":
+                    dow_desc = _describe_weekdays(dow)
+                    if dow_desc:
+                        return f"{dow_desc} {time_str}"
+
+                # M H D * *  →  每月 D 日 HH:MM
+                if month == "*" and dow == "*" and day != "*":
+                    if day == "last":
+                        return f"每月最后一天 {time_str}"
+                    if "," in day:
+                        return f"每月 {day} 日 {time_str}"
+                    return f"每月 {day} 日 {time_str}"
+
+                # M H D Mon *  →  每年 Mon 月 D 日 HH:MM
+                if dow == "*" and month != "*" and day != "*":
+                    # 检查是否为季度模式 (1,4,7,10)
+                    if month in ("1,4,7,10", "1,4,7,10") and day in ("1",):
+                        return f"每季度首日 {time_str}"
+                    return f"每年 {month} 月 {day} 日 {time_str}"
+
+        except Exception:
+            pass
+
+        return f"cron({expr})"
+
+    def _compute_first_cron_fire_time(self, cron_expr: str) -> Optional[datetime]:
+        """
+        根据 cron 表达式计算从当前时刻起的第一次触发时间。
+
+        Args:
+            cron_expr: 5 段 cron 表达式
+
+        Returns:
+            Optional[datetime]: 下次触发的 datetime，若 cron 无效则返回 None
+        """
+        try:
+            trigger = self._build_cron_trigger(cron_expr)
+            next_fire = trigger.get_next_fire_time(None, datetime.now())
+            return next_fire
+        except Exception:
+            return None
+
+    def _register_job(self, task: Dict[str, Any]) -> None:
+        """
+        为任务在 APScheduler 中注册 job。
+        一次性任务用 DateTrigger，循环任务用 CronTrigger。
+        需在 self._scheduler 已启动时调用。
+
+        Args:
+            task: 任务字典
+        """
+        if not self._scheduler:
+            return
+
+        task_id = str(task.get("task_id", ""))
+        if not task_id:
+            return
+
+        is_recurring = bool(task.get("is_recurring", False))
+        cron_expr = str(task.get("cron_expr", "") or "").strip()
+
+        try:
+            if is_recurring and cron_expr:
+                trigger = self._build_cron_trigger(cron_expr)
+            else:
+                remind_ts = float(task.get("remind_ts", 0.0))
+                if remind_ts <= 0:
+                    return
+                run_date = datetime.fromtimestamp(remind_ts)
+                # 若已过期，仍然注册——APScheduler 的 misfire_grace_time 会处理
+                trigger = DateTrigger(run_date=run_date)
+
+            self._scheduler.add_job(
+                self._on_task_due,
+                trigger=trigger,
+                id=task_id,
+                args=[task_id],
+                replace_existing=True,
+                misfire_grace_time=120,
+            )
+        except Exception as error:
+            logger.error(f"[Mai_Plan] 注册 job 失败（task_id={task_id}）：{error}")
+
+    def _unregister_job(self, task_id: str) -> None:
+        """
+        从 APScheduler 中移除指定 job。安全调用，不抛异常。
+
+        Args:
+            task_id: 任务 ID
+        """
+        if self._scheduler:
+            with contextlib.suppress(Exception):
+                self._scheduler.remove_job(task_id)
+
+    async def _on_task_due(self, task_id: str) -> None:
+        """
+        APScheduler 在任务触发时调用此回调。
+        处理发送提醒、更新任务状态和循环任务的下次调度。
+
+        Args:
+            task_id: 触发的任务 ID
+        """
+        async with self._tasks_lock:
+            document = self._read_tasks_document_unlocked()
+            tasks = document["tasks"]
+
+            target_task: Optional[Dict[str, Any]] = None
+            for task in tasks:
+                if str(task.get("task_id", "")) == task_id:
+                    target_task = task
+                    break
+
+            if not target_task:
+                logger.debug(f"[Mai_Plan] _on_task_due: 未找到任务 {task_id}，可能已被取消")
+                return
+
+            if str(target_task.get("status", "")) != TASK_STATUS_PENDING:
+                logger.debug(f"[Mai_Plan] _on_task_due: 任务 {task_id} 状态非 pending，跳过")
+                return
+
+        # 在锁外执行发送（可能耗时）
+        success, error_text = await self._send_due_task(target_task)
+        update_time = self._format_now()
+
+        async with self._tasks_lock:
+            latest_document = self._read_tasks_document_unlocked()
+            latest_tasks = latest_document["tasks"]
+
+            live_task: Optional[Dict[str, Any]] = None
+            for task in latest_tasks:
+                if str(task.get("task_id", "")) == task_id:
+                    live_task = task
+                    break
+
+            if not live_task:
+                return
+            if str(live_task.get("status", "")) != TASK_STATUS_PENDING:
+                return
+
+            is_recurring = bool(live_task.get("is_recurring", False))
+            live_task["last_attempt_at"] = update_time
+
+            if success:
+                if is_recurring:
+                    # 循环任务: 归档本次触发，更新下次时间，保持 pending
+                    occurrence = self._safe_int(live_task.get("occurrence_count", 0), 0, 0)
+                    occurrence += 1
+                    live_task["occurrence_count"] = occurrence
+                    live_task["triggered_at"] = update_time
+                    live_task["retry_count"] = 0
+                    live_task["last_error"] = ""
+
+                    # 归档本次触发记录
+                    if self.get_config("Others.save_plan_history", True):
+                        archive_copy = dict(live_task)
+                        archive_copy["occurrence_index"] = occurrence
+                        self._archive_task_to_history(archive_copy)
+
+                    # 从 scheduler 获取下次触发时间
+                    next_run = None
+                    if self._scheduler:
+                        job = self._scheduler.get_job(task_id)
+                        if job and job.next_run_time:
+                            next_run = job.next_run_time
+                    if next_run:
+                        live_task["remind_at"] = next_run.strftime(DEFAULT_TIME_FORMAT)
+                        live_task["remind_ts"] = next_run.timestamp()
+                    # 保持 status = pending
+                else:
+                    # 一次性任务: 归档 + 从文件删除
+                    live_task["status"] = TASK_STATUS_SENT
+                    live_task["triggered_at"] = update_time
+                    live_task["last_error"] = ""
+
+                    if self.get_config("Others.save_plan_history", True):
+                        self._archive_task_to_history(live_task)
+
+                    latest_document["tasks"] = [
+                        t for t in latest_tasks
+                        if str(t.get("task_id", "")) != task_id
+                    ]
+            else:
+                current_retry = self._safe_int(live_task.get("retry_count", 0), 0, 0)
+                current_retry += 1
+                live_task["retry_count"] = current_retry
+                live_task["last_error"] = error_text
+
+                max_retry = self._safe_int(self.get_config("scheduler.max_retry_count", 3), 3, 0)
+                if current_retry > max_retry:
+                    live_task["status"] = TASK_STATUS_FAILED
+                    # 循环任务失败时从 scheduler 移除
+                    if is_recurring:
+                        self._unregister_job(task_id)
+
+            self._write_tasks_document_unlocked(latest_document)
+
     def _parse_remind_datetime(self, remind_time_str: str) -> Tuple[Optional[datetime], str]:
         """
         解析提醒时间字符串为 datetime 对象。
@@ -1132,21 +1543,25 @@ class MaiPlanPlugin(BasePlugin):
         source_message_id: str = "",
         platform: str = "",
         is_group: bool = False,
+        is_recurring: bool = False,
+        cron_expr: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """
         创建一个新的计划任务并持久化。
-        进行参数校验、去重检查、时间验证。
-        
+        支持一次性任务和 cron 循环任务。
+
         Args:
             chat_id: 会话 ID
             creator_user_id: 创建者用户 ID
             creator_name: 创建者用户名
             content: 任务内容
-            remind_time_str: 提醒时间字符串
+            remind_time_str: 提醒时间字符串（一次性任务必填，循环任务可留空）
             source_message_id: 源消息 ID（可选）
             platform: 平台名（可选）
             is_group: 是否为群聊
-            
+            is_recurring: 是否为循环任务
+            cron_expr: cron 表达式（循环任务必填，5 段格式）
+
         Returns:
             Tuple[bool, str, Optional[Dict]]: (成功标志, 回复文本, 任务字典或 None)
         """
@@ -1157,24 +1572,59 @@ class MaiPlanPlugin(BasePlugin):
         if not content:
             return False, "创建任务失败：任务内容不能为空", None
 
-        remind_dt, parse_error = self._parse_remind_datetime(remind_time_str)
-        if remind_dt is None:
-            return False, parse_error, None
+        # ── 循环任务校验 ──
+        if is_recurring:
+            if not cron_expr or not cron_expr.strip():
+                return False, "创建循环任务失败：缺少 cron 表达式", None
+            cron_expr = cron_expr.strip()
 
-        remind_timestamp = remind_dt.timestamp()
-        min_future_seconds = self._safe_int(self.get_config("scheduler.min_future_seconds", 30), 30, 0)
-        if remind_timestamp < time.time() + min_future_seconds:
-            return False, f"创建失败：提醒时间必须晚于当前时间至少 {min_future_seconds} 秒", None
+            valid, cron_error = self._validate_cron_expr(cron_expr)
+            if not valid:
+                return False, f"创建循环任务失败：{cron_error}", None
 
-        remind_at = remind_dt.strftime(DEFAULT_TIME_FORMAT)
+            first_fire = self._compute_first_cron_fire_time(cron_expr)
+            if first_fire is None:
+                return False, "创建循环任务失败：无法计算首次触发时间", None
+
+            remind_dt = first_fire
+            remind_timestamp = remind_dt.timestamp()
+            remind_at = remind_dt.strftime(DEFAULT_TIME_FORMAT)
+        else:
+            # ── 一次性任务校验 ──
+            cron_expr = None
+            remind_dt, parse_error = self._parse_remind_datetime(remind_time_str)
+            if remind_dt is None:
+                return False, parse_error, None
+
+            remind_timestamp = remind_dt.timestamp()
+            min_future_seconds = self._safe_int(self.get_config("scheduler.min_future_seconds", 30), 30, 0)
+            if remind_timestamp < time.time() + min_future_seconds:
+                return False, f"创建失败：提醒时间必须晚于当前时间至少 {min_future_seconds} 秒", None
+
+            remind_at = remind_dt.strftime(DEFAULT_TIME_FORMAT)
         now_text = self._format_now()
 
         async with self._tasks_lock:
             document = self._read_tasks_document_unlocked()
             tasks = document["tasks"]
 
+            # 循环任务数量限制检查
+            if is_recurring:
+                max_recurring = self._safe_int(
+                    self.get_config("recurring.max_recurring_per_chat", 10), 10, 1
+                )
+                current_recurring = sum(
+                    1 for t in tasks
+                    if str(t.get("chat_id", "")) == chat_id
+                    and bool(t.get("is_recurring", False))
+                    and str(t.get("status", "")) == TASK_STATUS_PENDING
+                )
+                if current_recurring >= max_recurring:
+                    return False, f"创建失败：当前会话循环任务数已达上限（{max_recurring}）", None
+
+            task_type_hint = "（循环任务）" if is_recurring else "（一次性任务）"
             check_success, check_message, reasoning, model_name = await llm_api.generate_with_model(
-                f"你是任务匹配助手。请在“待处理任务列表”中找到与「{content}」基本相似的一条或多条重复任务，并仅返回该任务的 task_id。\n"
+                f"你是任务匹配助手。请在“待处理任务列表”中找到与「{content}」{task_type_hint}相同的一条或多条重复任务，并仅返回该任务的 task_id。\n"
                 "输出规则：\n"
                 "1) 只能输出 task_id 本身；\n"
                 "2) 不要输出解释、前后缀、标点、换行或代码块；\n"
@@ -1192,17 +1642,19 @@ class MaiPlanPlugin(BasePlugin):
                     if str(task.get("task_id", "")) in returned_ids:
                         return False, f"创建失败：相同提醒已存在（任务ID：{task.get('task_id', '-')})", task
 
-            for task in tasks:
-                if str(task.get("chat_id", "")) != chat_id:
-                    continue
-                if str(task.get("content", "")).strip() != content:
-                    continue
-                if str(task.get("remind_at", "")) != remind_at:
-                    continue
-                task_status = str(task.get("status", ""))
-                if task_status in {TASK_STATUS_PENDING, TASK_STATUS_SENT}:
-                    task_id = str(task.get("task_id", "-"))
-                    return False, f"创建失败：相同提醒已存在（任务ID：{task_id}）", task
+            # 精确去重（仅一次性任务）
+            # if not is_recurring:
+            #     for task in tasks:
+            #         if str(task.get("chat_id", "")) != chat_id:
+            #             continue
+            #         if str(task.get("content", "")).strip() != content:
+            #             continue
+            #         if str(task.get("remind_at", "")) != remind_at:
+            #             continue
+            #         task_status = str(task.get("status", ""))
+            #         if task_status in {TASK_STATUS_PENDING, TASK_STATUS_SENT}:
+            #             task_id = str(task.get("task_id", "-"))
+            #             return False, f"创建失败：相同提醒已存在（任务ID：{task_id}）", task
 
             existing_ids = {str(task.get("task_id", "")) for task in tasks}
             task_id = self._generate_task_id(existing_ids)
@@ -1225,19 +1677,36 @@ class MaiPlanPlugin(BasePlugin):
                 "retry_count": 0,
                 "last_error": "",
                 "source_message_id": source_message_id,
+                "is_recurring": is_recurring,
+                "cron_expr": cron_expr,
+                "occurrence_count": 0,
             }
 
             tasks.append(task)
             tasks.sort(key=lambda item: float(item.get("remind_ts", 0.0)))
             self._write_tasks_document_unlocked(document)
 
-        reply_text = "\n".join(
-            [
-                f"已创建计划任务：{content}",
-                f"提醒时间：{remind_at}",
-                f"任务ID：{task_id}",
-            ]
-        )
+        # 注册到 APScheduler
+        self._register_job(task)
+
+        if is_recurring:
+            cron_desc = self._describe_cron(cron_expr or "")
+            reply_text = "\n".join(
+                [
+                    f"已创建循环任务：{content}",
+                    f"循环规则：{cron_desc}",
+                    f"首次提醒：{remind_at}",
+                    f"任务ID：{task_id}",
+                ]
+            )
+        else:
+            reply_text = "\n".join(
+                [
+                    f"已创建计划任务：{content}",
+                    f"提醒时间：{remind_at}",
+                    f"任务ID：{task_id}",
+                ]
+            )
         return True, reply_text, task
 
     async def list_tasks(self, chat_id: str, include_done: bool = False) -> List[Dict[str, Any]]:
@@ -1322,6 +1791,8 @@ class MaiPlanPlugin(BasePlugin):
             ]
             self._write_tasks_document_unlocked(document)
 
+        # 从 APScheduler 移除 job
+        self._unregister_job(task_id)
         return True, f"已取消任务 {task_id}"
 
     async def update_task(
@@ -1330,9 +1801,10 @@ class MaiPlanPlugin(BasePlugin):
         task_id: str,
         new_content: Optional[str] = None,
         new_remind_time_str: Optional[str] = None,
+        new_cron_expr: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
-        修改一个待处理任务的内容和/或提醒时间。
+        修改一个待处理任务的内容、提醒时间和/或 cron 表达式。
         仅允许修改状态为 pending 的任务。
 
         Args:
@@ -1340,6 +1812,7 @@ class MaiPlanPlugin(BasePlugin):
             task_id: 任务 ID
             new_content: 新的任务内容（None 表示不修改）
             new_remind_time_str: 新的提醒时间字符串（None 表示不修改）
+            new_cron_expr: 新的 cron 表达式（None 表示不修改，仅循环任务可用）
 
         Returns:
             Tuple[bool, str]: (成功标志, 结果信息)
@@ -1347,8 +1820,8 @@ class MaiPlanPlugin(BasePlugin):
         if not task_id:
             return False, "修改失败：task_id 不能为空"
 
-        if not new_content and not new_remind_time_str:
-            return False, "修改失败：至少需要提供新的任务内容或新的提醒时间"
+        if not new_content and not new_remind_time_str and not new_cron_expr:
+            return False, "修改失败：至少需要提供新的任务内容、提醒时间或 cron 表达式"
 
         # 若提供了新时间，先在锁外完成解析校验
         new_remind_dt: Optional[datetime] = None
@@ -1395,135 +1868,77 @@ class MaiPlanPlugin(BasePlugin):
                 target_task["remind_ts"] = new_remind_dt.timestamp()
                 changes.append(f"提醒时间：{old_remind_at} → {new_remind_at}")
 
+            # 更新 cron 表达式（仅循环任务）
+            if new_cron_expr:
+                if not bool(target_task.get("is_recurring", False)):
+                    return False, "修改失败：仅循环任务可修改 cron 表达式"
+                new_cron_expr = new_cron_expr.strip()
+                valid, cron_error = self._validate_cron_expr(new_cron_expr)
+                if not valid:
+                    return False, f"修改失败：{cron_error}"
+                old_cron = str(target_task.get("cron_expr", ""))
+                target_task["cron_expr"] = new_cron_expr
+                # 重新计算下次触发时间
+                next_fire = self._compute_first_cron_fire_time(new_cron_expr)
+                if next_fire:
+                    target_task["remind_at"] = next_fire.strftime(DEFAULT_TIME_FORMAT)
+                    target_task["remind_ts"] = next_fire.timestamp()
+                changes.append(f"cron：{old_cron} → {new_cron_expr}")
+
+            need_rejob = bool(new_remind_time_str or new_cron_expr)
+
             target_task["updated_at"] = self._format_now()
 
             # 重新按提醒时间排序
             tasks.sort(key=lambda item: float(item.get("remind_ts", 0.0)))
             self._write_tasks_document_unlocked(document)
 
+        # 重新注册 APScheduler job
+        if need_rejob:
+            self._unregister_job(task_id)
+            self._register_job(target_task)
+
         change_detail = "；".join(changes)
         return True, f"已修改任务 {task_id}：{change_detail}"
 
     async def start_scheduler(self) -> None:
         """
-        启动提醒调度器。
-        创建后台异步任务，定期扫描和发送到期提醒。
+        启动 APScheduler 提醒调度器。
+        从 JSON 文件恢复所有 pending 任务的 job 注册。
         """
         if not bool(self.get_config("plugin.enabled", True)):
             logger.info("[Mai_Plan] 插件配置为禁用，跳过调度器启动")
             return
 
-        if self._scheduler_task and not self._scheduler_task.done():
+        if self._scheduler and self._scheduler.running:
             return
 
-        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
-        with contextlib.suppress(Exception):
-            self._scheduler_task.set_name("Mai_Plan_scheduler")
-        logger.info("[Mai_Plan] 提醒调度器已启动")
+        self._scheduler = AsyncIOScheduler(misfire_grace_time=120)
+        self._scheduler.start()
+
+        # 从 JSON 恢复所有 pending 任务
+        async with self._tasks_lock:
+            document = self._read_tasks_document_unlocked()
+            pending_tasks = [
+                task for task in document["tasks"]
+                if str(task.get("status", "")) == TASK_STATUS_PENDING
+            ]
+
+        registered_count = 0
+        for task in pending_tasks:
+            self._register_job(task)
+            registered_count += 1
+
+        logger.info(f"[Mai_Plan] APScheduler 调度器已启动，恢复 {registered_count} 个待处理任务")
 
     async def stop_scheduler(self) -> None:
         """
-        停止提醒调度器。
-        取消后台异步任务并等待其退出。
+        停止 APScheduler 提醒调度器。
         """
-        task = self._scheduler_task
-        self._scheduler_task = None
-
-        if task and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        logger.info("[Mai_Plan] 提醒调度器已停止")
-
-    async def _scheduler_loop(self) -> None:
-        """
-        调度器主循环。
-        周期性扫描并处理到期任务。
-        """
-        try:
-            while True:
-                try:
-                    await self._scan_due_tasks()
-                except Exception as error:
-                    logger.error(f"[Mai_Plan] 扫描到期任务失败：{error}", exc_info=True)
-
-                tick_seconds = self._safe_int(self.get_config("scheduler.tick_seconds", 10), 10, 1)
-                await asyncio.sleep(tick_seconds)
-        except asyncio.CancelledError:
-            logger.info("[Mai_Plan] 调度器任务收到取消信号")
-            raise
-
-    async def _scan_due_tasks(self) -> None:
-        """
-        扫描所有待提醒状态且已到期的任务。
-        为每个到期任务调用 _send_due_task 发送提醒并更新状态。
-        """
-        now_timestamp = time.time()
-        batch_limit = self._safe_int(self.get_config("scheduler.max_batch_per_tick", 10), 10, 1)
-
-        async with self._tasks_lock:
-            document = self._read_tasks_document_unlocked()
-            due_tasks = [
-                task.copy()
-                for task in document["tasks"]
-                if str(task.get("status", "")) == TASK_STATUS_PENDING
-                and float(task.get("remind_ts", 0.0)) <= now_timestamp
-            ]
-
-        if not due_tasks:
-            return
-
-        due_tasks.sort(key=lambda item: float(item.get("remind_ts", 0.0)))
-        due_tasks = due_tasks[:batch_limit]
-
-        for due_task in due_tasks:
-            task_id = str(due_task.get("task_id", ""))
-            if not task_id:
-                continue
-
-            success, error_text = await self._send_due_task(due_task)
-            update_time = self._format_now()
-
-            async with self._tasks_lock:
-                latest_document = self._read_tasks_document_unlocked()
-                latest_tasks = latest_document["tasks"]
-
-                target_task = None
-                for task in latest_tasks:
-                    if str(task.get("task_id", "")) == task_id:
-                        target_task = task
-                        break
-
-                if not target_task:
-                    continue
-
-                if str(target_task.get("status", "")) != TASK_STATUS_PENDING:
-                    continue
-
-                target_task["last_attempt_at"] = update_time
-                if success:
-                    target_task["status"] = TASK_STATUS_SENT
-                    target_task["triggered_at"] = update_time
-                    target_task["last_error"] = ""
-
-                    if self.get_config("Others.计划完成后保留任务记录", True):
-                        self._archive_task_to_history(target_task)
-
-                    latest_document["tasks"] = [
-                        t for t in latest_tasks
-                        if str(t.get("task_id", "")) != task_id
-                    ]
-                else:
-                    current_retry = self._safe_int(target_task.get("retry_count", 0), 0, 0)
-                    current_retry += 1
-                    target_task["retry_count"] = current_retry
-                    target_task["last_error"] = error_text
-
-                    max_retry = self._safe_int(self.get_config("scheduler.max_retry_count", 3), 3, 0)
-                    if current_retry > max_retry:
-                        target_task["status"] = TASK_STATUS_FAILED
-
-                self._write_tasks_document_unlocked(latest_document)
+        if self._scheduler and self._scheduler.running:
+            self._scheduler.shutdown(wait=False)
+        self._scheduler = None
+        logger.info("[Mai_Plan] APScheduler 调度器已停止")
 
     async def _send_due_task(self, task: Dict[str, Any]) -> Tuple[bool, str]:
         """

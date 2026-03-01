@@ -74,7 +74,7 @@ min_future_seconds = 60     # 创建任务时，允许的最小提前量
 
 [reminder]
 send_mode = "origin_chat"   # 提醒发送模式: origin_chat(原路返回) / private_first(优先私聊)
-prefix = "⏰ [计划提醒]"     # 提醒消息的前缀
+prefix = "[计划提醒]"     # 提醒消息的前缀
 notify_on_create = true     # 创建成功时是否发送提示消息
 
 [permission]
