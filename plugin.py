@@ -186,6 +186,9 @@ class MaiPlanCommand(BaseCommand):
         segments = args.split()
         subcommand = segments[0].lower()
 
+        operator_user_id = str(self.message.message_info.user_info.user_id)
+        is_admin = _plugin_instance.is_admin(operator_user_id)
+        
         if subcommand in {"help", "-h", "--help"}:
             await self.send_text(self._build_help_text(), storage_message = False)
             return True, None, 2
@@ -196,13 +199,18 @@ class MaiPlanCommand(BaseCommand):
                 mode = segments[1].lower()
 
             if mode not in {"pending", "all"}:
-                await self.send_text("参数错误：list 仅支持 pending 或 all", storage_message = False)
+                await self.send_text("参数错误", storage_message = False)
                 return False, "list 参数错误", 2
+            
+            if mode == "all" and not is_admin:
+                await self.send_text("权限不足，无法查看全部任务", storage_message = False)
+                return False, "权限不足查看全部任务", 2
 
             tasks = await _plugin_instance.list_tasks(
                 chat_id=self.message.chat_stream.stream_id,
-                include_done=(mode == "all"),
+                include_all_tasks=(mode == "all"),
             )
+
             await self.send_text(self._format_task_list(tasks, mode), storage_message = False)
             return True, None, 2
 
@@ -212,8 +220,6 @@ class MaiPlanCommand(BaseCommand):
                 return False, "缺少 task_id", 2
 
             task_id = segments[1].strip()
-            operator_user_id = str(self.message.message_info.user_info.user_id)
-            is_admin = _plugin_instance.is_admin(operator_user_id)
 
             success, text = await _plugin_instance.cancel_task(
                 chat_id=self.message.chat_stream.stream_id,
@@ -261,20 +267,23 @@ class MaiPlanCommand(BaseCommand):
                 return "当前会话暂无任何计划任务"
             return "当前会话暂无待处理计划任务"
 
-        lines = [f"当前会话任务列表（{len(tasks)} 条，模式：{mode}）"]
+        lines = [f"当前任务列表（{len(tasks)} 条，模式：{mode}）"]
         max_show = 20
 
         for index, task in enumerate(tasks[:max_show], start=1):
             task_id = str(task.get("task_id", "-"))
             content = str(task.get("content", "-"))
             remind_at = str(task.get("remind_at", "-"))
+            creator_name = str(task.get("creator_name", "-"))
             status_text = MaiPlanPlugin.status_to_text(str(task.get("status", "")))
             if bool(task.get("is_recurring", False)):
                 cron_desc = MaiPlanPlugin._describe_cron(str(task.get("cron_expr", "")))
                 occ = task.get("occurrence_count", 0)
-                lines.append(f"{index}. \U0001f501 [{task_id}] {content} | {cron_desc} | 下次: {remind_at} | 已触发{occ}次")
+                lines.append(
+                    f"{index}. \U0001f501 [{task_id}] {content} | {cron_desc} | 创建者: {creator_name} | 下次: {remind_at} | 已触发{occ}次"
+                )
             else:
-                lines.append(f"{index}. [{task_id}] {content} | {remind_at} | {status_text}")
+                lines.append(f"{index}. [{task_id}] {content} | 创建者: {creator_name} | {remind_at} | {status_text}")
 
         if len(tasks) > max_show:
             lines.append(f"... 还有 {len(tasks) - max_show} 条任务未显示")
@@ -313,7 +322,7 @@ class CreatePlanTaskTool(BaseTool):
             False,
             None,
         ),
-        ("creator_name", ToolParamType.STRING, "创建者名称（可从上下文获取）", False, None),
+        ("creator_name", ToolParamType.STRING, "创建计划用户的名称（可从上下文获取）", False, None),
         (
             "is_recurring",
             ToolParamType.BOOLEAN,
@@ -425,7 +434,7 @@ class DeletePlanTaskTool(BaseTool):
             # 先查询当前会话的待处理任务
             tasks = await _plugin_instance.list_tasks(
                 chat_id=self.chat_id,
-                include_done=False,
+                include_all_tasks=False,
             )
 
             matched: List[Dict[str, Any]] = []
@@ -556,7 +565,7 @@ class ModifyPlanTaskTool(BaseTool):
             # 在锁外完成 list_tasks 和 LLM 匹配，避免长时间持锁
             tasks = await _plugin_instance.list_tasks(
                 chat_id=self.chat_id,
-                include_done=False,
+                include_all_tasks=False,
             )
 
             if not tasks:
@@ -656,7 +665,7 @@ class ListPlanTasksTool(BaseTool):
         try:
             tasks = await _plugin_instance.list_tasks(
                 chat_id=self.chat_id,
-                include_done=(mode == "all"),
+                include_all_tasks=(mode == "all"),
             )
             content = self._format_task_list(tasks, mode)
             return {"name": self.name, "content": content}
@@ -679,6 +688,7 @@ class ListPlanTasksTool(BaseTool):
             task_id = str(task.get("task_id", "-"))
             content = str(task.get("content", "-"))
             remind_at = str(task.get("remind_at", "-"))
+            creator_name = str(task.get("creator_name", "-"))
             status = str(task.get("status", ""))
             status_map = {
                 TASK_STATUS_PENDING: "待提醒",
@@ -690,9 +700,11 @@ class ListPlanTasksTool(BaseTool):
             if bool(task.get("is_recurring", False)):
                 cron_desc = MaiPlanPlugin._describe_cron(str(task.get("cron_expr", "")))
                 occ = task.get("occurrence_count", 0)
-                lines.append(f"{index}. \U0001f501 [{task_id}] {content} | {cron_desc} | 下次: {remind_at} | 已触发{occ}次")
+                lines.append(
+                    f"{index}. \U0001f501 [{task_id}] {content} | {cron_desc} | 创建者: {creator_name} | 下次: {remind_at} | 已触发{occ}次"
+                )
             else:
-                lines.append(f"{index}. [{task_id}] {content} | {remind_at} | {status_text}")
+                lines.append(f"{index}. [{task_id}] {content} | 创建者: {creator_name} | {remind_at} | {status_text}")
 
         if len(tasks) > max_show:
             lines.append(f"... 还有 {len(tasks) - max_show} 条任务未显示")
@@ -1709,13 +1721,13 @@ class MaiPlanPlugin(BasePlugin):
             )
         return True, reply_text, task
 
-    async def list_tasks(self, chat_id: str, include_done: bool = False) -> List[Dict[str, Any]]:
+    async def list_tasks(self, chat_id: str, include_all_tasks: bool = False) -> List[Dict[str, Any]]:
         """
-        列出指定会话的任务。
+        列出任务。
         
         Args:
             chat_id: 会话 ID
-            include_done: 是否包含已完成或已失败的任务
+            include_all_tasks: 是否返回 plan_tasks.json 中的全部任务
             
         Returns:
             List[Dict[str, Any]]: 任务列表（按提醒时间排序）
@@ -1723,9 +1735,10 @@ class MaiPlanPlugin(BasePlugin):
         async with self._tasks_lock:
             document = self._read_tasks_document_unlocked()
 
-        tasks = [task for task in document["tasks"] if str(task.get("chat_id", "")) == chat_id]
-
-        if not include_done:
+        if include_all_tasks:
+            tasks = list(document["tasks"])
+        else:
+            tasks = [task for task in document["tasks"] if str(task.get("chat_id", "")) == chat_id]
             visible_status = {TASK_STATUS_PENDING, TASK_STATUS_FAILED}
             tasks = [task for task in tasks if str(task.get("status", "")) in visible_status]
 
