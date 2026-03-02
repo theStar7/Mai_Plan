@@ -1,5 +1,8 @@
 # Mai_Plan (麦麦计划表)
 
+> 如果这个项目对你有帮助，欢迎点个 Star 支持我！ 你的 Star 是对我的最大鼓励!  
+> 任何问题或建议，欢迎在 Issue 区反馈。
+
 **Mai_Plan** 是面向 MaiBot 的智能日程提醒插件。它不仅能听懂你的显式指令，还能敏锐捕捉闲聊中的未来安排、重要时刻或模糊约定，自动为你创建计划并在合适的时间发出提醒。
 
 即装即用告别遗忘，让麦麦成为你的贴身日程管家。
@@ -79,13 +82,18 @@ admin_user_ids = []         # 管理员ID列表，拥有取消任意任务的权
 
 ## 🛠️ 安装与依赖
 
-1. 确保 MaiBot 版本 `>= 0.12.1`。
-2. 将本插件文件夹放入 `MaiBot/plugins/` 目录。
-3. 重启 MaiBot，插件将自动加载。
-4. 即装即用，本插件依赖 MaiBot 核心环境，**无需**安装额外 Python 包。
+1. **环境要求**：MaiBot 版本 `>= 0.12.1`。
+2. **安装方式**：
+   - 将 `Mai_Plan` 文件夹整体放入 MaiBot 的 `plugins/` 目录下。
+   - 最终目录结构应为：`.../MaiBot/plugins/Mai_Plan/plugin.py`。
+3. **加载插件**：重启 MaiBot，控制台显示加载成功即可。
+4. **依赖项**：需要安装 `apscheduler`（用于定时调度）：       
+   ```bash
+   pip install apscheduler
+   ```
 
 ## 💾 数据存储
-任务数据默认存储在 `plan_tasks.json` 文件中。包含任务 ID、内容、提醒时间及当前状态（pending/sent/failed/cancelled）。
+任务数据存储在 `plan_tasks.json` 文件中。包含任务 ID、内容、提醒时间及当前状态（pending/sent/failed/cancelled）。
 历史任务储存在 `plan_tasks_history.json` 中。
 详细结构示例：
 ```json

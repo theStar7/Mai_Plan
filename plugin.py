@@ -52,107 +52,6 @@ TASK_STATUS_CANCELLED = "cancelled"
 _plugin_instance: Optional["MaiPlanPlugin"] = None
 
 
-class CreatePlanTaskAction(BaseAction):
-    """创建计划任务动作"""
-
-    action_name = "create_plan_task"
-    action_description = "根据聊天内容创建计划任务，并在指定时间提醒用户"
-    activation_type = ActionActivationType.NEVER
-    parallel_action = True
-    action_parameters = {
-        "topic": "内容的性质(如提醒计划、未来话题等)，由根据聊天内容进行提取和判断",
-        "task_content": "提醒,任务,记忆或话题的具体内容",
-        "remind_time": f"未来的回忆时间 或 调用提醒的时间，格式 {DEFAULT_TIME_FORMAT}（循环任务可留空）",
-        "is_recurring": "是否为循环任务（true/false），当用户表达周期性提醒需求时设为 true",
-        "cron_expr": "5段cron表达式（分 时 日 月 星期），仅循环任务需要。示例: 0 8 * * * 表示每天08:00",
-    }
-    action_require = [
-        "当用户明确表达提醒、日程、待办诉求时使用（如'提醒我明天开会'、'2小时后叫我'、'半小时后提醒'等，包括绝对时间和相对时间间隔）",
-        "相对时间处理：当用户说'X分钟后''X小时后'等相对时间时，必须调用此action，将相对时间加上当前时间换算为绝对时间。",
-        "智能推算：当感知到对方即将经历重要时刻（生日、纪念日、考试、出行、聚会等），主动安排在适当时机发送关怀或祝福（时间模糊时自行设定合理时刻，如生日前一晚20:00或当天08:00）。",
-        "模糊时间处理：当对方提到未来某段时间发生某事（如'明天下午去玩'），即使时间模糊，也必须主动推算出一个具体时刻（如'明天晚上20:00'）并创建计划来询问情况，而不仅仅是记录。",
-        "公共事件：当提及用户感兴趣的未来公共事件（电影上映、游戏发售、比赛开始等）时，主动创建提醒以便届时跟进讨论。",
-        "话题延续：当聊天话题聊到一半、对方说'下次再聊'或'改天继续'时，主动安排具体时间的续聊提醒。",
-        "如果已经存在相同内容和时间的计划任务, 则不重复创建",
-        "当用户表达周期性需求（每天、每周、每月等），使用 is_recurring=true 并提供 cron_expr",
-    ]
-    #associated_types = ["text"]
-
-    @staticmethod
-    def _extract_bool(data: dict, key: str) -> bool:
-        """从 action_data 中提取布尔值。"""
-        val = data.get(key)
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, str):
-            return val.strip().lower() in {"true", "1", "yes"}
-        return False
-
-    @staticmethod
-    def _extract_str(data: dict, key: str) -> "Optional[str]":
-        """从 action_data 中提取非空字符串，空则返回 None。"""
-        val = data.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-        return None
-
-
-    async def execute(self) -> Tuple[bool, str]:
-        """
-        执行创建计划任务的动作。
-        从 action_data 中提取任务内容和提醒时间，调用插件的 create_task 方法创建任务。
-        成功则返回确认消息，失败则返回错误提示。
-        
-        Returns:
-            Tuple[bool, str]: (成功标志, 回复文本)
-        """
-        global _plugin_instance
-
-        if _plugin_instance is None:
-            logger.warning("[Mai_Plan] 插件实例未初始化，无法创建计划任务")
-            return False, "插件未初始化"
-
-        if not _plugin_instance.is_scope_enabled(self.is_group):
-            return False, "当前会话类型未启用计划任务"
-
-        task_content = _plugin_instance.extract_task_content(self.action_data)
-        remind_time = _plugin_instance.extract_remind_time(self.action_data)
-        is_recurring = self._extract_bool(self.action_data, "is_recurring")
-        cron_expr = self._extract_str(self.action_data, "cron_expr")
-
-        if not task_content:
-            return True, "创建计划任务失败：缺少 task_content, 请要求用户提供具体的提醒内容"
-        if not is_recurring and not remind_time:
-            error_text = "创建计划任务失败：一次性任务缺少 remind_time, 请要求用户提供提醒时间"
-            return True, error_text
-
-        source_message_id = ""
-        if self.action_message and self.action_message.message_id:
-            source_message_id = str(self.action_message.message_id)
-
-        success, reply_text, _ = await _plugin_instance.create_task(
-            chat_id=self.chat_id,
-            creator_user_id=str(self.user_id or ""),
-            creator_name=str(self.user_nickname or "未知用户"),
-            content=task_content,
-            remind_time_str=remind_time,
-            source_message_id=source_message_id,
-            platform=str(self.platform or ""),
-            is_group=self.is_group,
-            is_recurring=is_recurring,
-            cron_expr=cron_expr,
-        )
-
-        if success:
-            #await self.send_text(reply_text)
-            return True, reply_text
-
-        #if _plugin_instance.get_config("reminder.notify_on_create_fail", False):
-            #await self.send_text(reply_text)
-
-        return False, reply_text
-
-
 class MaiPlanCommand(BaseCommand):
     """计划任务管理命令"""
 
@@ -311,7 +210,7 @@ class CreatePlanTaskTool(BaseTool):
         (
             "task_content",
             ToolParamType.STRING,
-            "Bot在提醒时间点需要提醒的内容, 或者填入bot在未来需要执行的具体行为描述（如发送什么消息、询问什么问题等），而不仅仅是记录事件本身。必填",
+            "Bot在提醒时间点需要提醒的内容, 或者填入bot在未来需要执行的具体行为。请保证内容简洁明了",
             True,
             None,
         ),
@@ -333,7 +232,7 @@ class CreatePlanTaskTool(BaseTool):
         (
             "cron_expr",
             ToolParamType.STRING,
-            "5段标准cron表达式（分 时 日 月 星期），仅 is_recurring=true 时必填。"
+            "请将用户的自然语言时间调度描述，转换为兼容 Python APScheduler (from_crontab) 的标准 5 字段 cron 表达式。仅 is_recurring=true 时必填"
             "特殊符号：* 任意值, , 列举, - 范围, / 步长, last 最后。"
             "常见示例：\n"
             "  每天08:00 → 0 8 * * *\n"
@@ -343,7 +242,10 @@ class CreatePlanTaskTool(BaseTool):
             "  每30分钟 → */30 * * * *\n"
             "  每2小时整点 → 0 */2 * * *\n"
             "  每年1月1日 → 0 0 1 1 *\n"
-            "  每季度首日 → 0 10 1 1,4,7,10 *",
+            "  每季度首日 → 0 10 1 1,4,7,10 *"
+            "- 每个月最后一天晚上11点 -> 0 23 last * *"
+            "工作日的上午10点到下午一点，每25分钟提醒一次 → 0,25,50 10-13 * * 1-5"
+            "注意：仅返回这 5 个字段组成的纯字符串，不要包含任何额外的解释文字、引号或 Markdown 代码块。",
             False,
             None,
         ),
@@ -854,7 +756,6 @@ class MaiPlanPlugin(BasePlugin):
             List[Tuple[ComponentInfo, Type]]: 组件元信息与类型的列表
         """
         return [
-            (CreatePlanTaskAction.get_action_info(), CreatePlanTaskAction),
             (MaiPlanCommand.get_command_info(), MaiPlanCommand),
             (MaiPlanStartupHandler.get_handler_info(), MaiPlanStartupHandler),
             (MaiPlanStopHandler.get_handler_info(), MaiPlanStopHandler),
