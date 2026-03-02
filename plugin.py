@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -58,6 +58,39 @@ SCHEDULE_TYPE_INTERVAL = "interval"
 CRON_KWARGS_ALLOWED_KEYS = {"year", "month", "day", "week", "day_of_week", "hour", "minute", "second"}
 
 _plugin_instance: Optional["MaiPlanPlugin"] = None
+
+
+ToolResultStatus = Literal["成功", "失败", "部分成功"]
+
+
+def _split_nonempty_lines(text: str) -> List[str]:
+    """将文本按行拆分，返回去空白且非空的行。"""
+    if not text:
+        return []
+    return [line.strip() for line in str(text).splitlines() if line.strip()]
+
+
+def _format_tool_result(
+    tool_name: str,
+    action_name: str,
+    status: ToolResultStatus,
+    summary: str,
+    details: Optional[List[str]] = None,
+) -> str:
+    """统一格式化 Tool 的结构化执行结果文本。"""
+    lines = [
+        f"执行结果：{status}",
+        f"工具：{tool_name}",
+        f"动作：{action_name}",
+        f"结果摘要：{summary}",
+    ]
+
+    normalized_details = [str(item).strip() for item in (details or []) if str(item).strip()]
+    if normalized_details:
+        lines.append("结果详情：")
+        lines.extend(f"- {item}" for item in normalized_details)
+
+    return "\n".join(lines)
 
 
 class MaiPlanCommand(BaseCommand):
@@ -207,7 +240,6 @@ class MaiPlanCommand(BaseCommand):
 
 class CreatePlanTaskTool(BaseTool):
     """创建计划任务工具（供 LLM 调用），支持一次性、cron 循环和 interval 固定间隔三种模式"""
-
     name = "create_plan_task_tool"
     description = (
         "核心功能：创建未来的计划提醒或主动关怀任务，支持一次性（once）、cron 循环（cron）和固定间隔（interval）三种模式。触发场景：\n"
@@ -279,12 +311,29 @@ class CreatePlanTaskTool(BaseTool):
     async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
         """执行创建计划任务。"""
         global _plugin_instance
+        action_name = "创建计划任务"
 
         if _plugin_instance is None:
-            return {"name": self.name, "content": "错误：Mai_Plan 插件未初始化"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "Mai_Plan 插件未初始化",
+                ),
+            }
 
         if not self.chat_stream or not self.chat_id:
-            return {"name": self.name, "content": "错误：无法获取当前会话信息"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "无法获取当前会话信息",
+                ),
+            }
 
         task_content = str(function_args.get("task_content", "")).strip()
         remind_time = str(function_args.get("remind_time", "")).strip()
@@ -294,38 +343,98 @@ class CreatePlanTaskTool(BaseTool):
         interval_expr = str(function_args.get("interval_expr", "") or "").strip() or None
 
         if not task_content:
-            return {"name": self.name, "content": "错误：task_content 不能为空, 请向用户要求提供具体的提醒内容"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "task_content 不能为空",
+                    ["请提供具体的提醒内容"],
+                ),
+            }
 
         # 校验 schedule_type
         if schedule_type not in (SCHEDULE_TYPE_ONCE, SCHEDULE_TYPE_CRON, SCHEDULE_TYPE_INTERVAL):
-            return {"name": self.name, "content": f"错误：schedule_type 必须为 'once'、'cron' 或 'interval'，收到：'{schedule_type}'"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "schedule_type 参数无效",
+                    [f"收到: {schedule_type}", "允许值: once / cron / interval"],
+                ),
+            }
 
         if schedule_type == SCHEDULE_TYPE_ONCE and not remind_time:
-            return {"name": self.name, "content": "错误：一次性任务必须提供 remind_time, 请向用户要求提供提醒时间"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "一次性任务必须提供 remind_time",
+                    [f"时间格式: {DEFAULT_TIME_FORMAT}"],
+                ),
+            }
 
         # 解析 cron_kwargs
         cron_kwargs: Optional[Dict[str, Any]] = None
         if schedule_type == SCHEDULE_TYPE_CRON:
             if not cron_kwargs_raw:
-                return {"name": self.name, "content": "错误：cron 循环任务必须提供 cron_kwargs, 请向用户要求提供执行周期"}
+                return {
+                    "name": self.name,
+                    "content": _format_tool_result(
+                        self.name,
+                        action_name,
+                        "失败",
+                        "cron 循环任务必须提供 cron_kwargs",
+                    ),
+                }
             if isinstance(cron_kwargs_raw, str):
                 try:
                     cron_kwargs = json.loads(cron_kwargs_raw)
                 except json.JSONDecodeError:
-                    return {"name": self.name, "content": "错误：cron_kwargs 必须是合法的 JSON 字符串"}
+                    return {
+                        "name": self.name,
+                        "content": _format_tool_result(
+                            self.name,
+                            action_name,
+                            "失败",
+                            "cron_kwargs 必须是合法的 JSON 字符串",
+                        ),
+                    }
             elif isinstance(cron_kwargs_raw, dict):
                 cron_kwargs = cron_kwargs_raw
             else:
-                return {"name": self.name, "content": "错误：cron_kwargs 格式无效"}
+                return {
+                    "name": self.name,
+                    "content": _format_tool_result(
+                        self.name,
+                        action_name,
+                        "失败",
+                        "cron_kwargs 格式无效",
+                    ),
+                }
 
         if schedule_type == SCHEDULE_TYPE_INTERVAL and not interval_expr:
-            return {"name": self.name, "content": "错误：interval 循环任务必须提供 interval_expr, 请向用户要求提供间隔时间（如 '30m'、'2h'）"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "interval 循环任务必须提供 interval_expr",
+                    ["示例: 30m / 2h / 1h30m"],
+                ),
+            }
 
         platform = str(getattr(self.chat_stream, "platform", "") or "")
         is_group = bool(getattr(self.chat_stream, "is_group", False))
 
         try:
-            success, reply_text, _ = await _plugin_instance.create_task(
+            success, reply_text, task = await _plugin_instance.create_task(
                 chat_id=self.chat_id,
                 creator_user_id="",
                 creator_name=creator_name,
@@ -338,10 +447,34 @@ class CreatePlanTaskTool(BaseTool):
                 cron_kwargs=cron_kwargs,
                 interval_expr=interval_expr,
             )
-            return {"name": self.name, "content": reply_text}
+            details = [f"schedule_type: {schedule_type}"]
+            if isinstance(task, dict):
+                task_id = str(task.get("task_id", "")).strip()
+                if task_id:
+                    details.insert(0, f"task_id: {task_id}")
+            details.extend(_split_nonempty_lines(reply_text))
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "成功" if success else "失败",
+                    "计划任务创建成功" if success else "计划任务创建失败",
+                    details,
+                ),
+            }
         except Exception as exc:
             logger.error(f"[Mai_Plan] CreatePlanTaskTool 执行异常：{exc}")
-            return {"name": self.name, "content": f"创建计划任务时发生错误：{exc}"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "创建计划任务时发生异常",
+                    [f"异常信息: {exc}"],
+                ),
+            }
 
 
 class DeletePlanTaskTool(BaseTool):
@@ -367,16 +500,41 @@ class DeletePlanTaskTool(BaseTool):
     async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
         """根据任务内容匹配并删除计划任务。"""
         global _plugin_instance
+        action_name = "取消计划任务"
 
         if _plugin_instance is None:
-            return {"name": self.name, "content": "错误：Mai_Plan 插件未初始化"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "Mai_Plan 插件未初始化",
+                ),
+            }
 
         if not self.chat_stream or not self.chat_id:
-            return {"name": self.name, "content": "错误：无法获取当前会话信息"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "无法获取当前会话信息",
+                ),
+            }
 
         task_content = str(function_args.get("task_content", "")).strip()
         if not task_content:
-            return {"name": self.name, "content": "错误：task_content 不能为空"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "task_content 不能为空",
+                ),
+            }
         
         try:
             # 先查询当前会话的待处理任务
@@ -415,13 +573,19 @@ class DeletePlanTaskTool(BaseTool):
             if not matched:
                 return {
                     "name": self.name,
-                    "content": f"未能找到内容包含「{task_content}」的任务, 删除任务失败!! 请向用户强调查询失败的结果 ,并要求用户提供更准确的任务信息（如完整的任务内容、提醒时间或直接提供以便正确匹配和删除",
+                    "content": _format_tool_result(
+                        self.name,
+                        action_name,
+                        "失败",
+                        "未找到可取消的目标任务",
+                        [f"查询关键词: {task_content}"],
+                    ),
                 }
 
-            if len(matched) > 1:
-                lines = [f"找到 {len(matched)} 条匹配任务，已全部取消："]
-            else:
-                lines = []
+            total = len(matched)
+            success_count = 0
+            fail_count = 0
+            details: List[str] = []
 
             for task in matched:
                 task_id = str(task.get("task_id", ""))
@@ -434,14 +598,45 @@ class DeletePlanTaskTool(BaseTool):
                 task_text = str(task.get("content", ""))
                 remind_at = str(task.get("remind_at", ""))
                 if cancel_success:
-                    lines.append(f"已取消成功任务：{task_text}（提醒时间：{remind_at}）")
+                    success_count += 1
+                    details.append(
+                        f"[{task_id}] {task_text} | 提醒时间: {remind_at} | 结果: 成功"
+                    )
                 else:
-                    lines.append(f"取消失败：{task_text} - {text}, 没有找到内容包含「{task_content}」的待处理任务")
+                    fail_count += 1
+                    details.append(
+                        f"[{task_id}] {task_text} | 提醒时间: {remind_at} | 结果: 失败（{text}）"
+                    )
 
-            return {"name": self.name, "content": "\n".join(lines)}
+            if success_count == total:
+                status: ToolResultStatus = "成功"
+            elif fail_count == total:
+                status = "失败"
+            else:
+                status = "部分成功"
+
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    status,
+                    f"匹配{total}条，成功{success_count}条，失败{fail_count}条",
+                    details,
+                ),
+            }
         except Exception as exc:
             logger.error(f"[Mai_Plan] DeletePlanTaskTool 执行异常：{exc}")
-            return {"name": self.name, "content": f"删除计划任务时发生错误：{exc}"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "取消计划任务时发生异常",
+                    [f"异常信息: {exc}"],
+                ),
+            }
 
 
 class ModifyPlanTaskTool(BaseTool):
@@ -495,16 +690,48 @@ class ModifyPlanTaskTool(BaseTool):
     async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
         """根据任务关键词匹配并修改计划任务。"""
         global _plugin_instance
+        action_name = "修改计划任务"
+        detail_request_more = [
+            "请提供更详细信息以便定位任务",
+            "优先提供 task_id",
+            "或提供完整任务内容（动作+对象）",
+            "并提供提醒时间（建议精确到分钟）",
+            "如为循环任务，可补充周期规则（cron/interval）",
+        ]
 
         if _plugin_instance is None:
-            return {"name": self.name, "content": "错误：Mai_Plan 插件未初始化"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "Mai_Plan 插件未初始化",
+                ),
+            }
 
         if not self.chat_stream or not self.chat_id:
-            return {"name": self.name, "content": "错误：无法获取当前会话信息"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "无法获取当前会话信息",
+                ),
+            }
 
         task_content = str(function_args.get("task_content", "")).strip()
         if not task_content:
-            return {"name": self.name, "content": "错误：task_content 不能为空"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "task_content 不能为空",
+                ),
+            }
 
         new_content = str(function_args.get("new_content", "") or "").strip() or None
         new_remind_time = str(function_args.get("new_remind_time", "") or "").strip() or None
@@ -518,14 +745,27 @@ class ModifyPlanTaskTool(BaseTool):
                 try:
                     new_cron_kwargs = json.loads(new_cron_kwargs_raw)
                 except json.JSONDecodeError:
-                    return {"name": self.name, "content": "错误：new_cron_kwargs 必须是合法的 JSON 字符串"}
+                    return {
+                        "name": self.name,
+                        "content": _format_tool_result(
+                            self.name,
+                            action_name,
+                            "失败",
+                            "new_cron_kwargs 必须是合法的 JSON 字符串",
+                        ),
+                    }
             elif isinstance(new_cron_kwargs_raw, dict):
                 new_cron_kwargs = new_cron_kwargs_raw
 
         if not new_content and not new_remind_time and not new_cron_kwargs and not new_interval_expr:
             return {
                 "name": self.name,
-                "content": "错误：至少需要提供 new_content、new_remind_time、new_cron_kwargs 或 new_interval_expr 中的一项，向用户强调修改任务失败，并要求用户重新提供新的任务内容或新的提醒时间",
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "至少需要提供 new_content、new_remind_time、new_cron_kwargs 或 new_interval_expr 中的一项",
+                ),
             }
 
         try:
@@ -538,7 +778,12 @@ class ModifyPlanTaskTool(BaseTool):
             if not tasks:
                 return {
                     "name": self.name,
-                    "content": "发生错误!!.向用户强调修改任务失败，因为当前会话暂无任何待处理任务，无法修改",
+                    "content": _format_tool_result(
+                        self.name,
+                        action_name,
+                        "失败",
+                        "当前会话暂无待处理任务，无法修改",
+                    ),
                 }
 
             matched: List[Dict[str, Any]] = []
@@ -566,17 +811,33 @@ class ModifyPlanTaskTool(BaseTool):
             if not matched:
                 return {
                     "name": self.name,
-                    "content": f"未找到与「{task_content}」匹配的待处理任务，向用户强调修改任务失败!! 并要求用户提供更准确的任务信息（如完整的任务内容、提醒时间或 task_id）",
+                    "content": _format_tool_result(
+                        self.name,
+                        action_name,
+                        "失败",
+                        "未找到匹配的待处理任务，无法修改",
+                        [f"查询关键词: {task_content}", *detail_request_more],
+                    ),
                 }
 
             if len(matched) > 1:
-                lines = [f"找到 {len(matched)} 条匹配任务，注意向用户强调修改任务失败!!原因是无法确定修改目标，请要求用户提供更精确的关键词："]
+                details = []
                 for idx, task in enumerate(matched, start=1):
                     tid = str(task.get("task_id", "-"))
                     tcontent = str(task.get("content", "-"))
                     tremind = str(task.get("remind_at", "-"))
-                    lines.append(f"{idx}. [{tid}] {tcontent} | {tremind}")
-                return {"name": self.name, "content": "\n".join(lines)}
+                    details.append(f"{idx}. [{tid}] {tcontent} | {tremind}")
+                details.extend(detail_request_more)
+                return {
+                    "name": self.name,
+                    "content": _format_tool_result(
+                        self.name,
+                        action_name,
+                        "失败",
+                        "匹配到多个候选，无法确定修改目标",
+                        details,
+                    ),
+                }
 
             target = matched[0]
             target_task_id = str(target.get("task_id", ""))
@@ -589,10 +850,30 @@ class ModifyPlanTaskTool(BaseTool):
                 new_cron_kwargs=new_cron_kwargs,
                 new_interval_expr=new_interval_expr,
             )
-            return {"name": self.name, "content": text}
+            details = [f"target_task_id: {target_task_id}"]
+            details.extend(_split_nonempty_lines(text))
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "成功" if success else "失败",
+                    "任务修改成功" if success else "任务修改失败",
+                    details,
+                ),
+            }
         except Exception as exc:
             logger.error(f"[Mai_Plan] ModifyPlanTaskTool 执行异常：{exc}")
-            return {"name": self.name, "content": f"修改计划任务时发生错误：{exc}"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "修改计划任务时发生异常",
+                    [f"异常信息: {exc}"],
+                ),
+            }
 
 
 class ListPlanTasksTool(BaseTool):
@@ -625,12 +906,29 @@ class ListPlanTasksTool(BaseTool):
     async def execute(self, function_args: Dict[str, Any]) -> Dict[str, Any]:
         """执行查询计划任务列表。"""
         global _plugin_instance
+        action_name = "查询计划任务列表"
 
         if _plugin_instance is None:
-            return {"name": self.name, "content": "错误：Mai_Plan 插件未初始化"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "Mai_Plan 插件未初始化",
+                ),
+            }
 
         if not self.chat_stream or not self.chat_id:
-            return {"name": self.name, "content": "错误：无法获取当前会话信息"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "无法获取当前会话信息",
+                ),
+            }
         
         inquirer_name = str(function_args.get("inquirer_name", "")).strip() or "未知用户"
 
@@ -640,21 +938,48 @@ class ListPlanTasksTool(BaseTool):
                 chat_id=self.chat_id,
                 include_all_tasks=(mode == "all"),
             )
-            content = self._format_task_list(tasks, mode, inquirer_name, self.chat_stream)
-            return {"name": self.name, "content": content}
+            if not tasks:
+                return {
+                    "name": self.name,
+                    "content": _format_tool_result(
+                        self.name,
+                        action_name,
+                        "成功",
+                        "查询完成，当前会话暂无任务",
+                    ),
+                }
+
+            task_list_text = self._format_task_list(tasks, mode, inquirer_name, self.chat_stream)
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "成功",
+                    f"查询完成，共{len(tasks)}条任务（mode={mode}）",
+                    _split_nonempty_lines(task_list_text),
+                ),
+            }
         except Exception as exc:
             logger.error(f"[Mai_Plan] ListPlanTasksTool 执行异常：{exc}")
-            return {"name": self.name, "content": f"查询计划任务时发生错误：{exc}"}
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "查询计划任务时发生异常",
+                    [f"异常信息: {exc}"],
+                ),
+            }
 
     @staticmethod
     def _format_task_list(tasks: List[Dict[str, Any]], mode: str, inquirer_name, chat_stream) -> str:
         """将任务列表格式化为可读文本。"""
         if not tasks:
-            if mode == "all":
-                return "**强调**: 查找失败, 当前会话暂无任何计划任务, 当前会话暂无任何计划任务"
-            return "**强调**: 查找失败, 当前会话暂无待处理计划任务, 当前会话暂无待处理计划任务"
+            return ""
 
-        lines = [f"当前会话任务列表（{len(tasks)} 条，模式：{mode}）"]
+        lines: List[str] = []
         max_show = 20
 
         is_group = bool(getattr(chat_stream, "is_group", False)) # 群聊中仅显示自己创建的任务，私聊中显示全部任务
@@ -689,6 +1014,9 @@ class ListPlanTasksTool(BaseTool):
                     )
                 else:
                     lines.append(f"{index}. [{task_id}] {content} | 创建者: {creator_name} | {remind_at} | {status_text}")
+
+        if not lines:
+            lines.append("当前查询者无可见任务（群聊仅展示本人创建的任务）")
 
         if len(tasks) > max_show:
             lines.append(f"... 还有 {len(tasks) - max_show} 条任务未显示")
@@ -1718,7 +2046,7 @@ class MaiPlanPlugin(BasePlugin):
                 SCHEDULE_TYPE_INTERVAL: "（间隔任务）",
                 SCHEDULE_TYPE_ONCE: "（一次性任务）",
             }
-            
+
             task_type_hint = type_label_map.get(schedule_type, "（一次性任务）")
             check_success, check_message, reasoning, model_name = await llm_api.generate_with_model(
                 "你是任务去重判定器，目标是降低误判（宁可漏判，不可错判）。\n"
