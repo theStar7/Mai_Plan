@@ -110,6 +110,11 @@ class MaiPlanCommand(BaseCommand):
             await self.send_text("Mai_Plan 插件尚未初始化", storage_message=False)
             return False, "插件未初始化", 2
 
+        is_group = bool(getattr(self.chat_stream, "is_group", False))
+        if not _plugin_instance.is_scope_enabled(is_group):
+            await self.send_text("当前会话不在插件启用范围内", storage_message=False)
+            return False, "插件未启用", 2
+
         if not self.message.chat_stream or not self.message.chat_stream.stream_id:
             await self.send_text("无法获取当前会话信息", storage_message=False)
             return False, "会话信息缺失", 2
@@ -320,7 +325,7 @@ class CreatePlanTaskTool(BaseTool):
                     self.name,
                     action_name,
                     "失败",
-                    "Mai_Plan 插件未初始化",
+                    "原因: Mai_Plan 插件未初始化",
                 ),
             }
 
@@ -331,7 +336,19 @@ class CreatePlanTaskTool(BaseTool):
                     self.name,
                     action_name,
                     "失败",
-                    "无法获取当前会话信息",
+                    "原因: 无法获取当前会话信息",
+                ),
+            }
+
+        is_group = bool(getattr(self.chat_stream, "is_group", False))
+        if not _plugin_instance.is_scope_enabled(is_group):
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "创建任务失败",
+                    "原因: 当前会话不在插件启用范围内, 当前会话不在插件启用范围内",
                 ),
             }
 
@@ -440,7 +457,6 @@ class CreatePlanTaskTool(BaseTool):
                 creator_name=creator_name,
                 content=task_content,
                 remind_time_str=remind_time,
-                source_message_id="",
                 platform=platform,
                 is_group=is_group,
                 schedule_type=schedule_type,
@@ -537,6 +553,18 @@ class DeletePlanTaskTool(BaseTool):
                 ),
             }
 
+        is_group = bool(getattr(self.chat_stream, "is_group", False))
+        if not _plugin_instance.is_scope_enabled(is_group):
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "删除任务失败",
+                    "当前会话不在插件启用范围内, 当前会话不在插件启用范围内",
+                ),
+            }
+
         task_content = str(function_args.get("task_content", "")).strip()
         operator_name = str(function_args.get("operator_name", "")).strip()
         if not task_content:
@@ -549,7 +577,7 @@ class DeletePlanTaskTool(BaseTool):
                     "task_content 不能为空",
                 ),
             }
-        
+
         try:
             tasks = await _plugin_instance.list_tasks(
                     chat_id=self.chat_id,
@@ -753,7 +781,7 @@ class ModifyPlanTaskTool(BaseTool):
                     self.name,
                     action_name,
                     "失败",
-                    "Mai_Plan 插件未初始化",
+                    "原因: Mai_Plan 插件未初始化",
                 ),
             }
 
@@ -764,7 +792,19 @@ class ModifyPlanTaskTool(BaseTool):
                     self.name,
                     action_name,
                     "失败",
-                    "无法获取当前会话信息",
+                    "原因: 无法获取当前会话信息",
+                ),
+            }
+
+        is_group = bool(getattr(self.chat_stream, "is_group", False))
+        if not _plugin_instance.is_scope_enabled(is_group):
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "修改失败",
+                    "原因: 当前会话不在插件启用范围内, 当前会话不在插件启用范围内",
                 ),
             }
 
@@ -985,10 +1025,22 @@ class ListPlanTasksTool(BaseTool):
                     self.name,
                     action_name,
                     "失败",
-                    "无法获取当前会话信息",
+                    "原因: 无法获取当前会话信息",
                 ),
             }
         
+        is_group = bool(getattr(self.chat_stream, "is_group", False))
+        if not _plugin_instance.is_scope_enabled(is_group):
+            return {
+                "name": self.name,
+                "content": _format_tool_result(
+                    self.name,
+                    action_name,
+                    "失败",
+                    "原因: 当前会话不在插件启用范围内, 当前会话不在插件启用范围内",
+                ),
+            }
+
         inquirer_name = str(function_args.get("inquirer_name", "")).strip() or "未知用户"
 
         mode = "pending"
@@ -1961,7 +2013,6 @@ class MaiPlanPlugin(BasePlugin):
         creator_name: str,
         content: str,
         remind_time_str: str,
-        source_message_id: str = "",
         platform: str = "",
         is_group: bool = False,
         schedule_type: str = SCHEDULE_TYPE_ONCE,
@@ -1978,7 +2029,6 @@ class MaiPlanPlugin(BasePlugin):
             creator_name: 创建者用户名
             content: 任务内容
             remind_time_str: 提醒时间字符串（一次性任务必填，循环/间隔任务可留空）
-            source_message_id: 源消息 ID（可选）
             platform: 平台名（可选）
             is_group: 是否为群聊
             schedule_type: 调度类型 ("once" / "cron" / "interval")
@@ -2131,7 +2181,6 @@ class MaiPlanPlugin(BasePlugin):
                 "last_attempt_at": None,
                 "retry_count": 0,
                 "last_error": "",
-                "source_message_id": source_message_id,
                 "schedule_type": schedule_type,
                 "cron_kwargs": cron_kwargs if schedule_type == SCHEDULE_TYPE_CRON else None,
                 "interval_seconds": interval_seconds if schedule_type == SCHEDULE_TYPE_INTERVAL else None,
@@ -2472,6 +2521,10 @@ class MaiPlanPlugin(BasePlugin):
         chat_id = str(task.get("chat_id", ""))
         content = str(task.get("content", "")).strip()
         remind_at = str(task.get("remind_at", "")).strip()
+
+        is_group = bool(task.get("is_group", False))
+        if not self.is_scope_enabled(is_group):
+            return False, f"任务 {task_id} 所在会话不在插件启用范围内，跳过提醒"
 
         if not chat_id:
             return False, f"任务 {task_id} 缺少 chat_id"
