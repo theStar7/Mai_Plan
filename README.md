@@ -54,7 +54,7 @@
 
 | 命令 | 参数 | 说明 | 示例 |
 | :--- | :--- | :--- | :--- |
-| `/mai_plan list` | `[pending\|all]` | <br>`pending`: 查看当前会话任务(默认)<br>`all`: 查看所有任务(仅限管理员) | `/mai_plan list` |
+| `/mai_plan list` | `[pending\|all]` | `pending`: 查看当前会话任务 (默认)<br>`all`: 查看所有任务 (仅限管理员) | `/mai_plan list pending` |
 | `/mai_plan cancel` | `<task_id>` | 取消指定 ID 的任务 | `/mai_plan cancel p_20260228_a1b2` |
 
 ---
@@ -64,17 +64,23 @@
 配置文件位于插件目录下的 `config.toml`。首次运行会自动生成默认配置。
 
 ```toml
-[scope]
-group = true        # 是否在群聊中启用
-private = true      # 是否在私聊中启用
+[plugin]
+enabled = true          # 是否启用插件
 
-[time]
-format = "%Y-%m-%d %H:%M:%S" # 内部时间格式
+[scope]
+group = True           # 是否在群聊中启用 (默认True)
+private = True         # 是否在私聊中启用 (默认True)
 
 [reminder]
 send_mode = "origin_chat"   # 提醒发送模式: origin_chat(原路返回) / private_first(优先私聊)
-prefix = "[计划提醒]"     # 提醒消息的前缀
-notify_on_create = true     # 创建成功时是否发送提示消息
+
+[recurring]
+max_recurring_per_chat = 10     # 每个会话最大循环/间隔任务数
+min_interval_seconds = 60       # 间隔任务最小间隔秒数
+max_interval_seconds = 604800   # 间隔任务最大间隔秒数（默认7天）
+
+[Others]
+save_plan_history = true    # 任务完成后是否将记录归档到 plan_history.json（否则直接删除）
 
 [permission]
 admin_user_ids = []         # 管理员ID列表，拥有取消任意任务的权限
@@ -82,19 +88,34 @@ admin_user_ids = []         # 管理员ID列表，拥有取消任意任务的权
 
 ## 🛠️ 安装与依赖
 
-1. **环境要求**：MaiBot 版本 `>= 0.12.1`。
-2. **安装方式**：
-   - 将 `Mai_Plan` 文件夹整体放入 MaiBot 的 `plugins/` 目录下。
-   - 最终目录结构应为：`.../MaiBot/plugins/Mai_Plan/plugin.py`。
-3. **加载插件**：重启 MaiBot，控制台显示加载成功即可。
-4. **依赖项**：需要安装 `apscheduler`（用于定时调度）：       
+1. 在plugins目录下载或克隆本仓库（麦麦旧版本可在release中下载适配旧版的插件）
+
    ```bash
-   pip install apscheduler
+   git clone https://github.com/theStar7/Mai_Plan
    ```
+
+2. 根据MaiBot的部署方法安装依赖：
+
+   - **uv安装**：在 `plugins\Mai_Plan` 文件夹下
+   
+     ```bash
+     uv pip install -r .\requirements.txt -i https://mirrors.aliyun.com/pypi/simple --upgrade
+     ```
+     
+   - **pip安装**：在 MaiBot 根目录下
+   
+     ```bash
+     # 激活虚拟环境 (Windows)
+     .\venv\Scripts\activate
+     
+     # 进入插件目录并安装依赖
+     cd .\plugins\Mai_Plan\
+     pip install -i https://mirrors.aliyun.com/pypi/simple -r .\requirements.txt --upgrade
+     ```
 
 ## 💾 数据存储
 任务数据存储在 `plan_tasks.json` 文件中。包含任务 ID、内容、提醒时间及当前状态（pending/sent/failed/cancelled）。
-历史任务储存在 `plan_tasks_history.json` 中。
+历史任务储存在 `plan_history.json` 中。
 详细结构示例：
 ```json
 {

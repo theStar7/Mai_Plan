@@ -31,18 +31,18 @@
       {
         "type": "command",
         "name": "mai_plan_command",
-        "description": "管理计划任务",
-        "pattern": "/mai_plan help|list|cancel"
+        "description": "管理计划任务：/mai_plan help|list|cancel",
+        "pattern": "^/mai_plan(?:\\s+(?P<args>.*))?$"
       },
       {
         "type": "event_handler",
         "name": "mai_plan_startup_handler",
-        "description": "启动提醒调度器"
+        "description": "Mai_Plan 启动时初始化提醒调度器"
       },
       {
         "type": "event_handler",
         "name": "mai_plan_stop_handler",
-        "description": "停止提醒调度器"
+        "description": "Mai_Plan 停止时关闭提醒调度器"
       },
       {
         "type": "tool",
