@@ -17,10 +17,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from src.chat.message_receive.chat_stream import get_chat_manager
 from src.plugin_system.apis import llm_api
-from src.config.config import global_config, model_config
-
-
-
+from src.config.config import model_config
 from src.common.logger import get_logger
 from src.plugin_system import (
     BaseCommand,
@@ -33,10 +30,7 @@ from src.plugin_system import (
     ToolParamType,
     register_plugin,
 )
-from src.plugin_system.apis import send_api
-from src.plugin_system.apis import generator_api
-
-
+from src.plugin_system.apis import generator_api, send_api
 
 logger = get_logger("Mai_Plan")
 
@@ -113,16 +107,16 @@ class MaiPlanCommand(BaseCommand):
         global _plugin_instance
 
         if _plugin_instance is None:
-            await self.send_text("Mai_Plan 插件尚未初始化", storage_message = False)
+            await self.send_text("Mai_Plan 插件尚未初始化", storage_message=False)
             return False, "插件未初始化", 2
 
         if not self.message.chat_stream or not self.message.chat_stream.stream_id:
-            await self.send_text("无法获取当前会话信息", storage_message = False)
+            await self.send_text("无法获取当前会话信息", storage_message=False)
             return False, "会话信息缺失", 2
 
         args = (self.matched_groups.get("args") or "").strip() if self.matched_groups else ""
         if not args:
-            await self.send_text(self._build_help_text(), storage_message = False)
+            await self.send_text(self._build_help_text(), storage_message=False)
             return True, None, 2
 
         segments = args.split()
@@ -130,9 +124,9 @@ class MaiPlanCommand(BaseCommand):
 
         operator_user_id = str(self.message.message_info.user_info.user_id)
         is_admin = _plugin_instance.is_admin(operator_user_id)
-        
+
         if subcommand in {"help", "-h", "--help"}:
-            await self.send_text(self._build_help_text(), storage_message = False)
+            await self.send_text(self._build_help_text(), storage_message=False)
             return True, None, 2
 
         if subcommand == "list":
@@ -141,11 +135,11 @@ class MaiPlanCommand(BaseCommand):
                 mode = segments[1].lower()
 
             if mode not in {"pending", "all"}:
-                await self.send_text("参数错误", storage_message = False)
+                await self.send_text("参数错误", storage_message=False)
                 return False, "list 参数错误", 2
             
             if mode == "all" and not is_admin:
-                await self.send_text("权限不足，无法查看全部任务", storage_message = False)
+                await self.send_text("权限不足，无法查看全部任务", storage_message=False)
                 return False, "权限不足查看全部任务", 2
 
             tasks = await _plugin_instance.list_tasks(
@@ -153,12 +147,12 @@ class MaiPlanCommand(BaseCommand):
                 include_all_tasks=(mode == "all"),
             )
 
-            await self.send_text(self._format_task_list(tasks, mode), storage_message = False)
+            await self.send_text(self._format_task_list(tasks, mode), storage_message=False)
             return True, None, 2
 
         if subcommand == "cancel":
             if len(segments) < 2:
-                await self.send_text("用法：/mai_plan cancel <task_id>", storage_message = False)
+                await self.send_text("用法：/mai_plan cancel <task_id>", storage_message=False)
                 return False, "缺少 task_id", 2
 
             task_id = segments[1].strip()
@@ -169,11 +163,11 @@ class MaiPlanCommand(BaseCommand):
                 operator_user_id=operator_user_id,
                 is_admin=is_admin,
             )
-            await self.send_text(text, storage_message = False  )
+            await self.send_text(text, storage_message=False)
             
             return success, text, 2
 
-        await self.send_text("未知子命令，请使用 /mai_plan help 查看帮助", storage_message = False)
+        await self.send_text("未知子命令，请使用 /mai_plan help 查看帮助", storage_message=False)
         return False, "未知子命令", 2
 
     def _build_help_text(self) -> str:
@@ -277,14 +271,6 @@ class CreatePlanTaskTool(BaseTool):
             "创建计划用户的名称（可从上下文获取）",
             False, None
         ),
-        #目前Tool不支持获取ID号，留着战未来
-        # (
-        #     "operator_id",
-        #     ToolParamType.STRING,
-        #     "创建者的数字ID号码（可从上下文获取）",
-        #     False,
-        #     None
-        # ),
         (
             "schedule_type",
             ToolParamType.STRING,
@@ -553,8 +539,6 @@ class DeletePlanTaskTool(BaseTool):
 
         task_content = str(function_args.get("task_content", "")).strip()
         operator_name = str(function_args.get("operator_name", "")).strip()
-        #is_admin = _plugin_instance.is_admin(operator_id) 暂不支持获取ID，先保留等待未来更新
-
         if not task_content:
             return {
                 "name": self.name,
@@ -566,16 +550,7 @@ class DeletePlanTaskTool(BaseTool):
                 ),
             }
         
-        is_group = bool(getattr(self.chat_stream, "is_group", False))
         try:
-            # 先查询当前会话的待处理任务
-            # if is_group:
-            #     tasks = await _plugin_instance.list_tasks(
-            #         chat_id=self.chat_id,
-            #         include_all_tasks = False,
-            #         creator_name = operator_user_name if operator_user_name else None
-            #     )
-            # else :
             tasks = await _plugin_instance.list_tasks(
                     chat_id=self.chat_id,
                     include_all_tasks=False,
@@ -593,8 +568,6 @@ class DeletePlanTaskTool(BaseTool):
                 }
 
             explicit_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", task_content))
-            
-            
             matched: List[Dict[str, Any]] = []
 
             if explicit_ids:
@@ -1032,8 +1005,7 @@ class ListPlanTasksTool(BaseTool):
                         action_name,
                         "成功",
                         "查询完成，当前会话暂无任务",
-                        "注意: 当前工具仅做查询展示，不包含任何删除或修改功能。你并未成功执行任何删除或修改任务"
-
+                        other_info="注意: 当前工具仅做查询展示，不包含任何删除或修改功能。你并未成功执行任何删除或修改任务"
                     ),
                 }
 
@@ -1046,7 +1018,7 @@ class ListPlanTasksTool(BaseTool):
                     "成功",
                     f"查询完成，共{len(tasks)}条任务（mode={mode}）",
                     _split_nonempty_lines(task_list_text),
-                    "注意: 当前工具仅做查询展示，不包含任何删除或修改功能。你并未成功执行任何删除或修改任务"
+                    other_info="注意: 当前工具仅做查询展示，不包含任何删除或修改功能。你并未成功执行任何删除或修改任务"
                 ),
             }
         except Exception as exc:
@@ -1071,7 +1043,8 @@ class ListPlanTasksTool(BaseTool):
         lines: List[str] = []
         max_show = 20
 
-        is_group = bool(getattr(chat_stream, "is_group", False)) # 群聊中仅显示自己创建的任务，私聊中显示全部任务
+        # 群聊中仅显示自己创建的任务，私聊中显示全部任务
+        is_group = bool(getattr(chat_stream, "is_group", False))
 
         for index, task in enumerate(tasks[:max_show], start=1):
             task_id = str(task.get("task_id", "-"))
@@ -1183,9 +1156,7 @@ class MaiPlanPlugin(BasePlugin):
     config_section_descriptions = {
         "plugin": "插件基础配置",
         "scope": "会话范围配置",
-        "time": "时间格式配置",
         "reminder": "提醒文案与发送策略",
-        "storage": "任务存储配置",
         "permission": "权限配置",
         "recurring": "循环任务配置",
     }
@@ -1193,16 +1164,12 @@ class MaiPlanPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="0.2.0", description="配置文件版本"),
+            "config_version": ConfigField(type=str, default="1.0.0", description="配置文件版本"),
         },
         "scope": {
             "group": ConfigField(type=bool, default=True, description="是否在群聊中生效"),
             "private": ConfigField(type=bool, default=True, description="是否在私聊中生效"),
         },
-        # 统一使用 DEFAULT_TIME_FORMAT，废弃配置项
-        # "time": {
-        #     "format": ConfigField(type=str, default=DEFAULT_TIME_FORMAT, description="任务时间格式"), 
-        # },
         "reminder": {
             "send_mode": ConfigField(
                 type=str,
@@ -1210,13 +1177,7 @@ class MaiPlanPlugin(BasePlugin):
                 description="提醒发送模式",
                 choices=["origin_chat", "private_first"],
             ),
-            # 废弃配置项
-            #"prefix": ConfigField(type=str, default="注意下述提醒内容", description="提醒消息前缀"),
         },
-        # 统一使用 plan_tasks.json，废弃配置项
-        # "storage": {
-        #     "tasks_file_name": ConfigField(type=str, default="plan_tasks.json", description="任务文件名"), 
-        # },
         "permission": {
             "admin_user_ids": ConfigField(type=list, default=[], description="管理员用户 ID 列表"),
         },
@@ -1297,20 +1258,6 @@ class MaiPlanPlugin(BasePlugin):
             parsed = default
         return max(minimum, parsed)
 
-    def _get_time_format(self) -> str:
-        """
-        获取配置中的时间格式字符串。
-        若配置为空或无效，使用默认时间格式。
-        
-        Returns:
-            str: 时间格式字符串
-        """
-        #time_format = self.get_config("time.format", DEFAULT_TIME_FORMAT) # 时间格式配置项已废弃，统一使用 DEFAULT_TIME_FORMAT
-        time_format = DEFAULT_TIME_FORMAT
-        if not isinstance(time_format, str) or not time_format.strip():
-            return DEFAULT_TIME_FORMAT
-        return time_format.strip()
-
     def _format_now(self) -> str:
         """
         获取当前时间的格式化字符串。
@@ -1327,11 +1274,7 @@ class MaiPlanPlugin(BasePlugin):
         Returns:
             Path: 任务文件路径
         """
-        #file_name = self.get_config("storage.tasks_file_name", "plan_tasks.json") # 任务文件名配置项已废弃，统一使用 plan_tasks.json
-        #if not isinstance(file_name, str) or not file_name.strip():
-        file_name = "plan_tasks.json"
-        safe_name = Path(file_name.strip()).name
-        return Path(self.plugin_dir) / safe_name
+        return Path(self.plugin_dir) / "plan_tasks.json"
 
     def _empty_tasks_document(self) -> Dict[str, Any]:
         """
@@ -1893,18 +1836,11 @@ class MaiPlanPlugin(BasePlugin):
         if not value:
             return None, "提醒时间不能为空"
 
-        formats: List[str] = [self._get_time_format()]
-        if DEFAULT_TIME_FORMAT not in formats:
-            formats.append(DEFAULT_TIME_FORMAT)
-
-        for time_format in formats:
-            try:
-                parsed = datetime.strptime(value, time_format)
-                return parsed, ""
-            except ValueError:
-                continue
-
-        return None, f"提醒时间格式错误，请使用 {DEFAULT_TIME_FORMAT}"
+        try:
+            parsed = datetime.strptime(value, DEFAULT_TIME_FORMAT)
+            return parsed, ""
+        except ValueError:
+            return None, f"提醒时间格式错误，请使用 {DEFAULT_TIME_FORMAT}"
 
     def _generate_task_id(self, existing_ids: set[str]) -> str:
         """
@@ -2175,20 +2111,6 @@ class MaiPlanPlugin(BasePlugin):
                         if str(task.get("task_id", "")) in returned_ids:
                             return False, f"创建失败：相同提醒已存在（任务ID：{task.get('task_id', '-')})", task
 
-            # 精确去重（仅一次性任务）
-            # if not is_recurring:
-            #     for task in tasks:
-            #         if str(task.get("chat_id", "")) != chat_id:
-            #             continue
-            #         if str(task.get("content", "")).strip() != content:
-            #             continue
-            #         if str(task.get("remind_at", "")) != remind_at:
-            #             continue
-            #         task_status = str(task.get("status", ""))
-            #         if task_status in {TASK_STATUS_PENDING, TASK_STATUS_SENT}:
-            #             task_id = str(task.get("task_id", "-"))
-            #             return False, f"创建失败：相同提醒已存在（任务ID：{task_id}）", task
-
             existing_ids = {str(task.get("task_id", "")) for task in tasks}
             task_id = self._generate_task_id(existing_ids)
 
@@ -2251,7 +2173,7 @@ class MaiPlanPlugin(BasePlugin):
             )
         return True, reply_text, task
 
-    async def list_tasks(self, chat_id: str, include_all_tasks: bool = False, creator_name: str = None) -> List[Dict[str, Any]]:
+    async def list_tasks(self, chat_id: str, include_all_tasks: bool = False, creator_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         列出任务。
         
@@ -2556,48 +2478,32 @@ class MaiPlanPlugin(BasePlugin):
         if not content:
             return False, f"任务 {task_id} 缺少 content"
 
-#         prefix = self.get_config("reminder.prefix", "⏰ 日程提醒")
-#         if not isinstance(prefix, str) or not prefix.strip():
-#             prefix = "⏰ 日程提醒"
-
         target_stream_id = self._resolve_target_stream_id(task)
         if not target_stream_id:
             return False, f"任务 {task_id} 缺少可用 stream_id"
 
         message_text = "\n".join(
             [
-                #str(prefix).strip(),
                 f"任务：{content}",
                 f"计划时间：{remind_at or '-'}",
-            #    f"任务ID：{task_id}",
             ]
         )
-        current_replyer = generator_api.get_replyer(chat_id = target_stream_id)
 
         generate_reply_success, llm_response = await generator_api.generate_reply(
-            chat_id = target_stream_id, 
+            chat_id=target_stream_id,
             reply_reason="现在需要执行你的回复计划或继续过去话题",
-            extra_info = "请依据以下信息生成符合人设回复内容：\n" + message_text,
-            )
-
-        if generate_reply_success :
-            success = await send_api.text_to_stream(
-            text=llm_response.content,
-            stream_id=target_stream_id,
-            storage_message=True,
+            extra_info="请依据以下信息生成符合人设回复内容：\n" + message_text,
         )
 
-        if not generate_reply_success:
-            logger.error(f"[Mai_Plan] 生成提醒回复失败，使用默认消息内容，错误信息：{llm_response}")
+        if generate_reply_success:
+            success = await send_api.text_to_stream(
+                text=llm_response.content,
+                stream_id=target_stream_id,
+                storage_message=True,
+            )
+            if success:
+                return True, ""
+            return False, f"任务 {task_id} 发送提醒失败（stream_id={target_stream_id}）"
 
-
-        # success = await send_api.text_to_stream(
-        #     text=message_text,
-        #     stream_id=target_stream_id,
-        #     storage_message=True,
-        # )
-
-        if success:
-            return True, ""
-
-        return False, f"任务 {task_id} 发送提醒失败（stream_id={target_stream_id}）"
+        logger.error(f"[Mai_Plan] 生成提醒回复失败，错误信息：{llm_response}")
+        return False, f"任务 {task_id} 生成提醒回复失败"
