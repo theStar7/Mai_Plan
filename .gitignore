@@ -3,3 +3,4 @@ config.toml*
 plan_tasks.json
 Mai_Plan_Implementation.md
 plan_history.json
+.ruff_cache
