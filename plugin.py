@@ -23,8 +23,6 @@ from src.config.config import global_config, model_config
 
 from src.common.logger import get_logger
 from src.plugin_system import (
-    ActionActivationType,
-    BaseAction,
     BaseCommand,
     BaseEventHandler,
     BasePlugin,
@@ -76,6 +74,7 @@ def _format_tool_result(
     status: ToolResultStatus,
     summary: str,
     details: Optional[List[str]] = None,
+    other_info: str = "",
 ) -> str:
     """统一格式化 Tool 的结构化执行结果文本。"""
     lines = [
@@ -89,6 +88,9 @@ def _format_tool_result(
     if normalized_details:
         lines.append("结果详情：")
         lines.extend(f"- {item}" for item in normalized_details)
+
+    if other_info.strip():
+        lines.append(f"其他信息：{other_info.strip()}")
 
     return "\n".join(lines)
 
@@ -204,8 +206,8 @@ class MaiPlanCommand(BaseCommand):
         """
         if not tasks:
             if mode == "all":
-                return "当前会话暂无任何计划任务"
-            return "当前会话暂无待处理计划任务"
+                return "暂无任何计划任务"
+            return "暂无待处理计划任务"
 
         lines = [f"当前任务列表（{len(tasks)} 条，模式：{mode}）"]
         max_show = 20
@@ -251,8 +253,6 @@ class CreatePlanTaskTool(BaseTool):
         "4. 【话题延续】话题未尽或约定改天再聊时，创建续聊任务。\n"
         "5. 【cron 循环日程】用户表达周期性的循环提醒需求时（如每天、每周几、每月几号等），设置 schedule_type='cron' 并提供 cron_kwargs。\n"
         "6. 【固定间隔】用户表达固定间隔重复提醒需求（如每隔30分钟、每2小时提醒一次），设置 schedule_type='interval' 并提供 interval_expr。\n"
-        # "重要： 对“X分钟后/X小时后/X天后”这类相对时间，在确认存在提醒意图后，优先调用工具并换算为绝对 remind_time。"
-        "注意：task_content 必须是Bot到时候要执行的'具体行为描述'（说什么话/做什么事），而不仅仅是记录事件本身。"
     )
     parameters = [
         (
@@ -271,7 +271,20 @@ class CreatePlanTaskTool(BaseTool):
             False,
             None,
         ),
-        ("creator_name", ToolParamType.STRING, "创建计划用户的名称（可从上下文获取）", False, None),
+        (
+            "creator_name", 
+            ToolParamType.STRING, 
+            "创建计划用户的名称（可从上下文获取）",
+            False, None
+        ),
+        #目前Tool不支持获取ID号，留着战未来
+        # (
+        #     "operator_id",
+        #     ToolParamType.STRING,
+        #     "创建者的数字ID号码（可从上下文获取）",
+        #     False,
+        #     None
+        # ),
         (
             "schedule_type",
             ToolParamType.STRING,
@@ -304,7 +317,8 @@ class CreatePlanTaskTool(BaseTool):
             "示例：'30m'（每30分钟）、'2h'（每2小时）、'1h30m'（每1.5小时）、'1d'（每天）、'90s'（每90秒）。",
             False,
             None,
-        ),
+        )
+
     ]
     available_for_llm = True
 
@@ -341,7 +355,7 @@ class CreatePlanTaskTool(BaseTool):
         schedule_type = str(function_args.get("schedule_type", "") or "").strip().lower() or SCHEDULE_TYPE_ONCE
         cron_kwargs_raw = function_args.get("cron_kwargs")
         interval_expr = str(function_args.get("interval_expr", "") or "").strip() or None
-
+        operator_id = str(function_args.get("operator_id", "") or "").strip() or None
         if not task_content:
             return {
                 "name": self.name,
@@ -436,7 +450,7 @@ class CreatePlanTaskTool(BaseTool):
         try:
             success, reply_text, task = await _plugin_instance.create_task(
                 chat_id=self.chat_id,
-                creator_user_id="",
+                creator_user_id=operator_id or "",
                 creator_name=creator_name,
                 content=task_content,
                 remind_time_str=remind_time,
@@ -459,7 +473,7 @@ class CreatePlanTaskTool(BaseTool):
                     self.name,
                     action_name,
                     "成功" if success else "失败",
-                    "计划任务创建成功" if success else "计划任务创建失败",
+                    "创建成功" if success else "创建计划任务失败",
                     details,
                 ),
             }
@@ -490,10 +504,17 @@ class DeletePlanTaskTool(BaseTool):
         (
             "task_content",
             ToolParamType.STRING,
-            "要取消的任务的描述, 包含时间或内容或task_id等关键信息的关键词, 工具会根据该关键词模糊匹配待处理任务列表并取消匹配到的任务",
+            "要取消的任务线索，建议包含 task_id 或完整内容+提醒时间。工具将高精度匹配，线索不充分时会拒绝执行以避免误删。",
             True,
             None,
         ),
+        (
+            "operator_name",
+            ToolParamType.STRING,
+            "执行取消操作的用户的昵称（可从上下文获取）",
+            False,
+            None,
+        )
     ]
     available_for_llm = True
 
@@ -501,6 +522,12 @@ class DeletePlanTaskTool(BaseTool):
         """根据任务内容匹配并删除计划任务。"""
         global _plugin_instance
         action_name = "取消计划任务"
+        detail_request_more = [
+            "请提供更详细信息以便定位任务",
+            "优先提供 task_id",
+            "或提供完整任务内容（动作+对象）",
+            "并提供提醒时间（建议精确到分钟）",
+        ]
 
         if _plugin_instance is None:
             return {
@@ -525,6 +552,9 @@ class DeletePlanTaskTool(BaseTool):
             }
 
         task_content = str(function_args.get("task_content", "")).strip()
+        operator_name = str(function_args.get("operator_name", "")).strip()
+        #is_admin = _plugin_instance.is_admin(operator_id) 暂不支持获取ID，先保留等待未来更新
+
         if not task_content:
             return {
                 "name": self.name,
@@ -536,39 +566,69 @@ class DeletePlanTaskTool(BaseTool):
                 ),
             }
         
+        is_group = bool(getattr(self.chat_stream, "is_group", False))
         try:
             # 先查询当前会话的待处理任务
+            # if is_group:
+            #     tasks = await _plugin_instance.list_tasks(
+            #         chat_id=self.chat_id,
+            #         include_all_tasks = False,
+            #         creator_name = operator_user_name if operator_user_name else None
+            #     )
+            # else :
             tasks = await _plugin_instance.list_tasks(
-                chat_id=self.chat_id,
-                include_all_tasks=False,
-            )
+                    chat_id=self.chat_id,
+                    include_all_tasks=False,
+                )
 
+            if not tasks:
+                return {
+                    "name": self.name,
+                    "content": _format_tool_result(
+                        self.name,
+                        action_name,
+                        "失败",
+                        "暂无待处理任务，无法取消",
+                    ),
+                }
+
+            explicit_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", task_content))
+            
+            
             matched: List[Dict[str, Any]] = []
-            llm_success, llm_content, reasoning, model_name = await llm_api.generate_with_model(
-                f"你是任务匹配助手。请在“待处理任务列表”中找到与关键词「{task_content}」对应的一条或多条任务，并仅返回该任务的 task_id。\n"
-                "输出规则：\n"
-                "1) 只能输出 task_id 本身；\n"
-                "2) 不要输出解释、前后缀、标点、换行或代码块；\n"
-                "3) 若没有明确匹配项，返回空字符串；\n"
-                f"待处理任务列表：{tasks}",
-                model_config.model_task_config.tool_use,
-                request_type="mai_only_you",
-            )
-            if llm_success and llm_content:
-                returned_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", llm_content.strip()))
-                if not returned_ids:
-                    returned_ids = {llm_content.strip()}
+
+            if explicit_ids:
                 matched = [
                     task
                     for task in tasks
-                    if str(task.get("task_id", "")) in returned_ids
+                    if str(task.get("task_id", "")) in explicit_ids
                 ]
-
-            # 旧版本的模糊匹配逻辑，可能会误伤多个任务，因此改为让 LLM 精确返回 task_id 来匹配
-            # matched = [
-            #     t for t in tasks
-            #     if task_content in str(t.get("content", "")) + str(t.get("task_id", ""))
-            # ]
+            else:
+                llm_success, llm_content, reasoning, model_name = await llm_api.generate_with_model(
+                    "你是任务删除匹配判定器，目标是避免误删（宁可漏匹配，不可错匹配）。\n"
+                    f"用户删除线索：{task_content}\n"
+                    "请在“待处理任务列表”中找出与该线索“确定对应”的任务 task_id。\n"
+                    "判定要求：\n"
+                    "1) 仅在证据充分时返回：task_id精确命中，或任务内容的动作+对象明确一致，或提醒时间明确一致；\n"
+                    "2) 若线索过于模糊/存在多种解释，返回None；\n"
+                    "3) 不允许基于主题相近或联想猜测匹配。\n"
+                    "输出规则：\n"
+                    "1) 只输出 task_id，多个用单个空格分隔；\n"
+                    "2) 不输出解释、前后缀、标点、换行或代码块；\n"
+                    "3) 无法确定时输出None。\n"
+                    f"待处理任务列表：{tasks}",
+                    model_config.model_task_config.tool_use,
+                    request_type="mai_only_you",
+                )
+                if llm_success and llm_content:
+                    returned_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", llm_content.strip()))
+                    if not returned_ids:
+                        returned_ids = {llm_content.strip()}
+                    matched = [
+                        task
+                        for task in tasks
+                        if str(task.get("task_id", "")) in returned_ids
+                    ]
 
             if not matched:
                 return {
@@ -578,7 +638,7 @@ class DeletePlanTaskTool(BaseTool):
                         action_name,
                         "失败",
                         "未找到可取消的目标任务",
-                        [f"查询关键词: {task_content}"],
+                        [f"查询关键词: {task_content}", *detail_request_more],
                     ),
                 }
 
@@ -589,14 +649,21 @@ class DeletePlanTaskTool(BaseTool):
 
             for task in matched:
                 task_id = str(task.get("task_id", ""))
+                task_text = str(task.get("content", ""))
+                remind_at = str(task.get("remind_at", ""))
+                task_creator = str(task.get("creator_name", ""))
+                if operator_name and task_creator and operator_name != task_creator:
+                    fail_count += 1
+                    details.append(
+                        f"[{task_id}] {task_text} | 提醒时间: {remind_at} | 结果: 失败（无权限：操作者「{operator_name}」非任务创建者「{task_creator}」）"
+                    )
+                    continue
                 cancel_success, text = await _plugin_instance.cancel_task(
                     chat_id=self.chat_id,
                     task_id=task_id,
                     operator_user_id="",
                     is_admin=True,
                 )
-                task_text = str(task.get("content", ""))
-                remind_at = str(task.get("remind_at", ""))
                 if cancel_success:
                     success_count += 1
                     details.append(
@@ -684,6 +751,13 @@ class ModifyPlanTaskTool(BaseTool):
             False,
             None,
         ),
+        (
+            "operator_name",
+            ToolParamType.STRING,
+            "执行修改操作的用户的昵称（可从上下文获取）",
+            False,
+            None,
+        )
     ]
     available_for_llm = True  # 启用修改工具
 
@@ -737,6 +811,7 @@ class ModifyPlanTaskTool(BaseTool):
         new_remind_time = str(function_args.get("new_remind_time", "") or "").strip() or None
         new_cron_kwargs_raw = function_args.get("new_cron_kwargs")
         new_interval_expr = str(function_args.get("new_interval_expr", "") or "").strip() or None
+        operator_name = str(function_args.get("operator_name", "") or "").strip() or None
 
         # 解析 new_cron_kwargs
         new_cron_kwargs: Optional[Dict[str, Any]] = None
@@ -773,6 +848,7 @@ class ModifyPlanTaskTool(BaseTool):
             tasks = await _plugin_instance.list_tasks(
                 chat_id=self.chat_id,
                 include_all_tasks=False,
+                creator_name=operator_name if operator_name else None
             )
 
             if not tasks:
@@ -782,17 +858,25 @@ class ModifyPlanTaskTool(BaseTool):
                         self.name,
                         action_name,
                         "失败",
-                        "当前会话暂无待处理任务，无法修改",
+                        "暂无待处理任务，无法修改",
                     ),
                 }
 
             matched: List[Dict[str, Any]] = []
             llm_success, llm_content, reasoning, model_name = await llm_api.generate_with_model(
-                f"你是任务匹配助手。请在\u201c待处理任务列表\u201d中找到与关键词「{task_content}」对应的一条任务，并仅返回该任务的 task_id。\n"
+                "你是任务修改匹配判定器，目标是避免错判（宁可漏判，不可误判）。\n"
+                f"用户提供的修改线索：{task_content}\n"
+                "请在“待处理任务列表”中找出与线索“确定对应”的任务，并返回 task_id。\n"
+                "判定规则：\n"
+                "1) 若线索中包含 task_id，优先按 task_id 精确匹配；\n"
+                "2) 内容匹配必须满足动作+对象一致，主题相近不算同一任务；\n"
+                "3) 若线索包含时间（日期/时刻），需与 remind_at 一致或高度一致；\n"
+                "4) 若仅能猜测或证据不足，返回None；\n"
+                "5) 若存在多个同等明确候选，返回所有 task_id（空格分隔）。\n"
                 "输出规则：\n"
-                "1) 只能输出 task_id 本身；\n"
+                "1) 只输出 task_id 本身；\n"
                 "2) 不要输出解释、前后缀、标点、换行或代码块；\n"
-                "3) 若没有明确匹配项，返回空字符串；\n"
+                "3) 若没有明确匹配项，返回None；\n"
                 "4) 若有多条匹配，用空格分隔所有 task_id；\n"
                 f"待处理任务列表：{tasks}",
                 model_config.model_task_config.tool_use,
@@ -880,12 +964,14 @@ class ListPlanTasksTool(BaseTool):
     """查询计划任务列表工具（供 LLM 调用）"""
 
     name = "list_plan_tasks_tool"
-    description = ( 
-                    "适用于查询当前会话中的计划任务列表和提醒任务"
-                    "适用于当用户表达查询计划任务的意图时调用，例如“我有哪些提醒”“列出我的计划”“还有什么待办”等"
-                    "**强调**: 以下场景禁止调用本工具：取消或删除提醒任务时（应使用 delete_plan_task_tool）、修改提醒任务内容/时间时（应使用 modify_plan_task_tool）、创建新的提醒任务时（应使用 create_plan_task_tool）"
-                    "**强调**: 以下场景禁止调用本工具：取消或删除提醒任务时（应使用 delete_plan_task_tool）、修改提醒任务内容/时间时（应使用 modify_plan_task_tool）、创建新的提醒任务时（应使用 create_plan_task_tool）"
-                   )
+    description = (
+        "查询当前会话中的计划,任务,提醒列表。"
+        "当用户只想查看任务时调用，例如“我有哪些提醒”“列出我的计划”“还有什么待办”。"
+        "出现“取消/删除/作废/不用提醒”意图时，必须调用 delete_plan_task_tool；"
+        "出现“修改/改时间/改内容/延期/提前”意图时，必须调用 modify_plan_task_tool；"
+        "出现“创建/新增/设一个提醒”意图时，必须调用 create_plan_task_tool。"
+        "若用户表达的是操作意图（增删改）而非查询意图，严禁先调用本工具。"
+    )
     parameters = [
         (
             "mode",
@@ -936,7 +1022,7 @@ class ListPlanTasksTool(BaseTool):
         try:
             tasks = await _plugin_instance.list_tasks(
                 chat_id=self.chat_id,
-                include_all_tasks=(mode == "all"),
+                include_all_tasks=False,
             )
             if not tasks:
                 return {
@@ -946,6 +1032,8 @@ class ListPlanTasksTool(BaseTool):
                         action_name,
                         "成功",
                         "查询完成，当前会话暂无任务",
+                        "注意: 当前工具仅做查询展示，不包含任何删除或修改功能。你并未成功执行任何删除或修改任务"
+
                     ),
                 }
 
@@ -958,6 +1046,7 @@ class ListPlanTasksTool(BaseTool):
                     "成功",
                     f"查询完成，共{len(tasks)}条任务（mode={mode}）",
                     _split_nonempty_lines(task_list_text),
+                    "注意: 当前工具仅做查询展示，不包含任何删除或修改功能。你并未成功执行任何删除或修改任务"
                 ),
             }
         except Exception as exc:
@@ -1121,7 +1210,8 @@ class MaiPlanPlugin(BasePlugin):
                 description="提醒发送模式",
                 choices=["origin_chat", "private_first"],
             ),
-            "prefix": ConfigField(type=str, default="日程提醒", description="提醒消息前缀"),
+            # 废弃配置项
+            #"prefix": ConfigField(type=str, default="注意下述提醒内容", description="提醒消息前缀"),
         },
         # 统一使用 plan_tasks.json，废弃配置项
         # "storage": {
@@ -2048,34 +2138,42 @@ class MaiPlanPlugin(BasePlugin):
             }
 
             task_type_hint = type_label_map.get(schedule_type, "（一次性任务）")
-            check_success, check_message, reasoning, model_name = await llm_api.generate_with_model(
-                "你是任务去重判定器，目标是降低误判（宁可漏判，不可错判）。\n"
-                f"待创建任务：content=「{content}」{task_type_hint}，chat_id={chat_id}，schedule_type={schedule_type}，"
-                f"remind_at={remind_at}，cron_kwargs={cron_kwargs if schedule_type == SCHEDULE_TYPE_CRON else None}，"
-                f"interval_seconds={interval_seconds if schedule_type == SCHEDULE_TYPE_INTERVAL else None}。\n"
-                "请在“待处理任务列表”中只返回与待创建任务“确定重复”的 task_id。\n"
-                "重复判定硬条件（必须全部满足）：\n"
-                "1) chat_id 相同；\n"
-                "2) status 必须为 pending；\n"
-                "3) schedule_type 相同；\n"
-                "4) content 核心语义相同（动作+对象一致；仅主题相近不算重复）；\n"
-                "5) 分类型附加条件：once 要求 remind_at 相同；cron 要求 cron_kwargs 等价；interval 要求 interval_seconds 相同。\n"
-                "输出规则：\n"
-                "1) 只输出 task_id，多个用单个空格分隔；\n"
-                "2) 不输出解释、前后缀、标点、换行或代码块；\n"
-                "3) 若无法确定重复，返回空字符串；\n"
-                f"待处理任务列表：{tasks}",
-                model_config.model_task_config.tool_use,
-                request_type="mai_only_you",
-            )
+            llm_candidate_tasks = [
+                task for task in tasks
+                if str(task.get("chat_id", "")) == chat_id
+                and str(task.get("status", "")) == TASK_STATUS_PENDING
+                and str(task.get("schedule_type", SCHEDULE_TYPE_ONCE) or SCHEDULE_TYPE_ONCE).lower() == schedule_type
+            ]
 
-            if check_success and check_message:
-                returned_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", check_message.strip()))
-                if not returned_ids:
-                    returned_ids = {check_message.strip()}
-                for task in tasks:
-                    if str(task.get("task_id", "")) in returned_ids:
-                        return False, f"创建失败：相同提醒已存在（任务ID：{task.get('task_id', '-')})", task
+            if llm_candidate_tasks:
+                check_success, check_message, reasoning, model_name = await llm_api.generate_with_model(
+                    "你是任务去重判定器，目标是降低误判（宁可漏判，不可错判）。\n"
+                    f"待创建任务：content=「{content}」{task_type_hint}，chat_id={chat_id}，schedule_type={schedule_type}，"
+                    f"remind_at={remind_at}，cron_kwargs={cron_kwargs if schedule_type == SCHEDULE_TYPE_CRON else None}，"
+                    f"interval_seconds={interval_seconds if schedule_type == SCHEDULE_TYPE_INTERVAL else None}。\n"
+                    "请在“待处理任务列表”中只返回与待创建任务“确定重复”的 task_id。\n"
+                    "重复判定硬条件（必须全部满足）：\n"
+                    "1) chat_id 相同；\n"
+                    "2) status 必须为 pending；\n"
+                    "3) schedule_type 相同；\n"
+                    "4) content 核心语义相同（动作+对象一致；仅主题相近不算重复）；\n"
+                    "5) 分类型附加条件：once 要求 remind_at 相同；cron 要求 cron_kwargs 等价；interval 要求 interval_seconds 相同。\n"
+                    "输出规则：\n"
+                    "1) 只输出 task_id，多个用单个空格分隔；\n"
+                    "2) 不输出解释、前后缀、标点、换行或代码块；\n"
+                    "3) 若无法确定重复，返回None；\n"
+                    f"待处理任务列表：{llm_candidate_tasks}",
+                    model_config.model_task_config.tool_use,
+                    request_type="mai_only_you",
+                )
+
+                if check_success and check_message:
+                    returned_ids = set(re.findall(r"\bp_[0-9a-fA-F]{6,12}\b", check_message.strip()))
+                    if not returned_ids:
+                        returned_ids = {check_message.strip()}
+                    for task in llm_candidate_tasks:
+                        if str(task.get("task_id", "")) in returned_ids:
+                            return False, f"创建失败：相同提醒已存在（任务ID：{task.get('task_id', '-')})", task
 
             # 精确去重（仅一次性任务）
             # if not is_recurring:
@@ -2153,13 +2251,14 @@ class MaiPlanPlugin(BasePlugin):
             )
         return True, reply_text, task
 
-    async def list_tasks(self, chat_id: str, include_all_tasks: bool = False) -> List[Dict[str, Any]]:
+    async def list_tasks(self, chat_id: str, include_all_tasks: bool = False, creator_name: str = None) -> List[Dict[str, Any]]:
         """
         列出任务。
         
         Args:
             chat_id: 会话 ID
             include_all_tasks: 是否返回 plan_tasks.json 中的全部任务
+            creator_name: 任务创建者名称（可选，用于筛选特定创建者创建的任务）
             
         Returns:
             List[Dict[str, Any]]: 任务列表（按提醒时间排序）
@@ -2171,6 +2270,8 @@ class MaiPlanPlugin(BasePlugin):
             tasks = list(document["tasks"])
         else:
             tasks = [task for task in document["tasks"] if str(task.get("chat_id", "")) == chat_id]
+            if creator_name is not None:
+                tasks = [task for task in tasks if str(task.get("creator_name", "")) == creator_name]
             visible_status = {TASK_STATUS_PENDING, TASK_STATUS_FAILED}
             tasks = [task for task in tasks if str(task.get("status", "")) in visible_status]
 
@@ -2455,9 +2556,9 @@ class MaiPlanPlugin(BasePlugin):
         if not content:
             return False, f"任务 {task_id} 缺少 content"
 
-        prefix = self.get_config("reminder.prefix", "⏰ 日程提醒")
-        if not isinstance(prefix, str) or not prefix.strip():
-            prefix = "⏰ 日程提醒"
+#         prefix = self.get_config("reminder.prefix", "⏰ 日程提醒")
+#         if not isinstance(prefix, str) or not prefix.strip():
+#             prefix = "⏰ 日程提醒"
 
         target_stream_id = self._resolve_target_stream_id(task)
         if not target_stream_id:
@@ -2465,7 +2566,7 @@ class MaiPlanPlugin(BasePlugin):
 
         message_text = "\n".join(
             [
-                str(prefix).strip(),
+                #str(prefix).strip(),
                 f"任务：{content}",
                 f"计划时间：{remind_at or '-'}",
             #    f"任务ID：{task_id}",
