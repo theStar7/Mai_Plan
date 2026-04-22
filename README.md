@@ -68,8 +68,8 @@
 enabled = true          # 是否启用插件
 
 [scope]
-group = True           # 是否在群聊中启用 (默认True)
-private = True         # 是否在私聊中启用 (默认True)
+group = true           # 是否在群聊中启用 (默认True)
+private = true         # 是否在私聊中启用 (默认True)
 
 [reminder]
 send_mode = "origin_chat"   # 提醒发送模式: origin_chat(原路返回) / private_first(优先私聊)
